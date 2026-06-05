@@ -4,6 +4,7 @@ import cors from 'cors';
 import analyzeRouter from './routes/analyze.js';
 import sessionsRouter from './routes/sessions.js';
 import settingsRouter from './routes/settings.js';
+import mcpRouter from './routes/mcp.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -23,5 +24,6 @@ app.use(express.json({ limit: '25mb' })); // recordings with screenshots can be 
 app.use('/api', analyzeRouter);
 app.use('/api/sessions', sessionsRouter);
 app.use('/api/settings', settingsRouter);
+app.use('/api/mcp', mcpRouter);
 
 app.listen(PORT, () => console.log(`Server → http://localhost:${PORT}`));

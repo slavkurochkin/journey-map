@@ -33,6 +33,22 @@ const FOLLOWUP_SUGGESTIONS = [
   'Has anything like this broken before?',
 ];
 
+// Quick-select change-intent questions ("Sharpen this analysis"). Optional —
+// answers feed the impact prompt as ground-truth facts about how it's shipping.
+const SHARPEN = [
+  { key: 'uiChange',            label: 'Changes the UI?',             options: ['no', 'visual only', 'flow/behavior'] },
+  { key: 'responseShape',       label: 'Changes API response shape?', options: ['yes', 'no', 'not sure'] },
+  { key: 'backwardsCompatible', label: 'Backwards-compatible?',       options: ['yes', 'no', 'not sure'] },
+  { key: 'migration',           label: 'Needs a DB migration?',       options: ['yes', 'no', 'not sure'] },
+  { key: 'flag',                label: 'Behind a feature flag?',      options: ['yes', 'no', 'not sure'] },
+  { key: 'rollout',             label: 'Rollout',                     options: ['all at once', 'gradual', 'canary'] },
+];
+const FACT_LABEL = Object.fromEntries(SHARPEN.map((q) => [q.key, q.label.replace(/\?$/, '')]));
+function factsToLines(answers) {
+  return Object.entries(answers || {}).filter(([, v]) => v).map(([k, v]) => `${FACT_LABEL[k] ?? k}: ${v}`);
+}
+const cleanFacts = (a) => Object.fromEntries(Object.entries(a || {}).filter(([, v]) => v));
+
 function summarizeResult(result) {
   const lines = [result.summary || ''];
   for (const c of result.concerns ?? []) {
@@ -51,6 +67,32 @@ export default function ImpactAnalysis({ onViewOnMap, loadedReport = null }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [editingChange, setEditingChange] = useState(false); // reopen the full change editor after results
+  const [answers, setAnswers] = useState({}); // fixed "Sharpen" quick-select answers
+  const [dynamicQ, setDynamicQ] = useState([]); // model-generated questions [{key,label,options,answer}]
+  const [loadingQuestions, setLoadingQuestions] = useState(false);
+  const [lastSig, setLastSig] = useState(null); // facts signature at last analyze (dirty tracking)
+
+  const dynamicLines = () => dynamicQ.filter((d) => d.answer).map((d) => `${d.label.replace(/\?$/, '')}: ${d.answer}`);
+  const factsSig = () => JSON.stringify({ f: cleanFacts(answers), d: dynamicQ.map((d) => [d.label, d.answer || '']) });
+
+  async function suggestQuestions() {
+    const subject = (query || change).trim();
+    if (!subject || loadingQuestions) return;
+    setLoadingQuestions(true);
+    try {
+      const res = await fetch('/api/sessions/impact/questions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: subject }),
+      });
+      if (res.ok) {
+        const { questions } = await res.json();
+        setDynamicQ((questions || []).map((q) => ({ key: q.key, label: q.label, options: q.options, answer: undefined })));
+      }
+    } finally {
+      setLoadingQuestions(false);
+    }
+  }
 
   const [thread, setThread] = useState([]); // [{ role: 'user'|'assistant', text }]
   const [chatInput, setChatInput] = useState('');
@@ -76,6 +118,11 @@ export default function ImpactAnalysis({ onViewOnMap, loadedReport = null }) {
     setResult(loadedReport.result || null);
     setTestPlan(loadedReport.testPlan || null);
     setThread(loadedReport.thread || []); setVotes({}); setView('blast'); setSelected(null);
+    const loadedAnswers = loadedReport.facts || {};
+    const loadedDyn = loadedReport.dynamicQA || [];
+    setAnswers(loadedAnswers);
+    setDynamicQ(loadedDyn.map((d) => ({ key: d.key || d.label, label: d.label, options: d.options || [], answer: d.answer })));
+    setLastSig(JSON.stringify({ f: cleanFacts(loadedAnswers), d: loadedDyn.map((d) => [d.label, d.answer || '']) }));
     setSavedLink(null); setError(null);
     fetch('/api/sessions/aggregate/map')
       .then((r) => (r.ok ? r.json() : null))
@@ -90,7 +137,10 @@ export default function ImpactAnalysis({ onViewOnMap, loadedReport = null }) {
       const res = await fetch('/api/sessions/impact/reports', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ change, result, testPlan, thread }),
+        body: JSON.stringify({
+          change, result, testPlan, thread, facts: cleanFacts(answers),
+          dynamicQA: dynamicQ.filter((d) => d.answer).map((d) => ({ key: d.key, label: d.label, options: d.options, answer: d.answer })),
+        }),
       });
       if (res.ok) {
         const { id } = await res.json();
@@ -207,12 +257,14 @@ export default function ImpactAnalysis({ onViewOnMap, loadedReport = null }) {
     setSavedLink(null);
     setEditingChange(false);
     setChange(query);
+    const facts = cleanFacts(answers);
+    setLastSig(factsSig());
     try {
       const [impactRes, mapRes] = await Promise.all([
         fetch('/api/sessions/impact', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ query }),
+          body: JSON.stringify({ query, facts, extraFacts: dynamicLines() }),
         }),
         fetch('/api/sessions/aggregate/map'),
       ]);
@@ -238,9 +290,11 @@ export default function ImpactAnalysis({ onViewOnMap, loadedReport = null }) {
     setThread(nextThread);
     setChatLoading(true);
 
-    // Build message history: the change, the analysis summary, then the conversation
+    // Build message history: the change (+ stated facts), the analysis summary, then the conversation
+    const factLines = [...factsToLines(answers), ...dynamicLines()];
+    const factsText = factLines.length ? `\n\nChange facts:\n${factLines.map((l) => `- ${l}`).join('\n')}` : '';
     const messages = [
-      { role: 'user', content: `I'm making this change:\n${change}\n\nAnalyze the impact.` },
+      { role: 'user', content: `I'm making this change:\n${change}${factsText}\n\nAnalyze the impact.` },
       { role: 'assistant', content: result ? summarizeResult(result) : 'Analysis complete.' },
       ...nextThread.map((t) => ({ role: t.role, content: t.text })),
     ];
@@ -361,6 +415,91 @@ export default function ImpactAnalysis({ onViewOnMap, loadedReport = null }) {
           </button>
         </div>
       )}
+
+      {/* Sharpen — optional quick-select facts about the change that refine the analysis */}
+      {(() => {
+        const dirty = result && factsSig() !== lastSig;
+        const answered = Object.values(answers).filter(Boolean).length + dynamicQ.filter((d) => d.answer).length;
+        const pill = (sel) => `text-xs font-medium px-2.5 py-1 rounded-full transition-colors ${
+          sel ? 'bg-emerald-600 text-white' : 'bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700'
+        }`;
+        return (
+          <div className="bg-white dark:bg-gray-900 rounded-2xl border border-gray-200/70 dark:border-gray-800 shadow-soft px-5 py-4">
+            <div className="flex items-center justify-between gap-3">
+              <p className="text-xs font-semibold text-gray-500 dark:text-gray-400">
+                Sharpen this analysis <span className="font-normal text-gray-400 dark:text-gray-500">· optional{answered ? ` · ${answered} set` : ''}</span>
+              </p>
+              {dirty && (
+                <button onClick={handleAnalyze} disabled={loading} className="text-xs font-medium text-emerald-600 dark:text-emerald-400 hover:text-emerald-800 dark:hover:text-emerald-300 disabled:opacity-50 transition-colors shrink-0">
+                  Re-analyze with these →
+                </button>
+              )}
+            </div>
+            <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-x-10 gap-y-2.5">
+              {SHARPEN.map((q) => (
+                <div key={q.key} className="flex items-center justify-between gap-3 flex-wrap">
+                  <span className="text-sm text-gray-600 dark:text-gray-300">{q.label}</span>
+                  <div className="flex gap-1 shrink-0">
+                    {q.options.map((opt) => {
+                      const sel = answers[q.key] === opt;
+                      return (
+                        <button
+                          key={opt}
+                          onClick={() => setAnswers((a) => ({ ...a, [q.key]: a[q.key] === opt ? undefined : opt }))}
+                          className={`text-xs font-medium px-2.5 py-1 rounded-full transition-colors ${
+                            sel
+                              ? 'bg-emerald-600 text-white'
+                              : 'bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700'
+                          }`}
+                        >
+                          {opt}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Model-generated, change-specific questions */}
+            {dynamicQ.length > 0 && (
+              <div className="mt-3 pt-3 border-t border-gray-100 dark:border-gray-800">
+                <p className="text-[11px] text-emerald-500 dark:text-emerald-400 mb-2 flex items-center gap-1">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" /> Tailored to this change
+                </p>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-10 gap-y-2.5">
+                  {dynamicQ.map((q, idx) => (
+                    <div key={q.key || idx} className="flex items-center justify-between gap-3 flex-wrap">
+                      <span className="text-sm text-gray-600 dark:text-gray-300">{q.label}</span>
+                      <div className="flex gap-1 shrink-0">
+                        {q.options.map((opt) => (
+                          <button
+                            key={opt}
+                            onClick={() => setDynamicQ((prev) => prev.map((d, i) => (i === idx ? { ...d, answer: d.answer === opt ? undefined : opt } : d)))}
+                            className={pill(q.answer === opt)}
+                          >
+                            {opt}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <div className="mt-3">
+              <button
+                onClick={suggestQuestions}
+                disabled={loadingQuestions || !(query || change).trim()}
+                className="text-xs font-medium text-emerald-600 dark:text-emerald-400 hover:text-emerald-800 dark:hover:text-emerald-300 disabled:opacity-40 transition-colors"
+              >
+                {loadingQuestions ? 'Thinking…' : dynamicQ.length ? '↻ Regenerate questions' : '✨ Suggest questions for this change'}
+              </button>
+            </div>
+          </div>
+        );
+      })()}
 
       {error && (
         <div className="bg-red-50 dark:bg-red-500/10 border border-red-200 dark:border-red-500/30 rounded-lg p-4 text-red-700 dark:text-red-300 text-sm">{error}</div>

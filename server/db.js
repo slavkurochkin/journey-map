@@ -167,6 +167,23 @@ migrate(`CREATE TABLE IF NOT EXISTS impact_reports (
 // Follow-up Q&A saved alongside the report (JSON [{role,text}]). Forward-compatible:
 // per-message author/timestamp can be added later without a migration.
 migrate(`ALTER TABLE impact_reports ADD COLUMN thread TEXT`);
+// Author-stated change-intent facts (JSON {flag, backwardsCompatible, ...}) that
+// sharpened the analysis — saved so a reopened report reflects the same inputs.
+migrate(`ALTER TABLE impact_reports ADD COLUMN facts TEXT`);
+// Model-generated clarifying questions + their answers (JSON [{label,options,answer}]).
+migrate(`ALTER TABLE impact_reports ADD COLUMN dynamic_qa TEXT`);
+// Registry of remote MCP servers the user connects. auth_token is a third-party
+// secret stored locally (single-user, self-hosted) — never returned to the client.
+migrate(`CREATE TABLE IF NOT EXISTS mcp_servers (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  url TEXT NOT NULL,
+  auth_token TEXT,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL
+)`);
+// Optional per-server tool allowlist (JSON array). Empty/null = all tools allowed.
+migrate(`ALTER TABLE mcp_servers ADD COLUMN allowed_tools TEXT`);
 
 // ---- Data migrations / cleanup (run once at startup) ----
 

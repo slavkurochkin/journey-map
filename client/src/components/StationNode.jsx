@@ -57,8 +57,19 @@ export default function StationNode({ data, selected }) {
   const baseC = data.color ? customPalette(data.color, dark) : (DOMAIN[data.domain] ?? DOMAIN.other);
   const subtitleColor = dark ? (baseC.dtext ?? baseC.text) : baseC.text;
 
-  const lensStatus = data.lens ? resolveLensStatus(data.lens, data) : null;
-  const lens = lensStatus ? LENS[lensStatus] : null;
+  // A "service:<name>" lens highlights stations that call that backend service
+  // (from trace + manual data) and dims the rest — a journey-scoped service map.
+  const serviceLens = typeof data.lens === 'string' && data.lens.startsWith('service:') ? data.lens.slice('service:'.length) : null;
+  let lens;
+  if (serviceLens) {
+    const match = (data.services || []).some((s) => s.toLowerCase() === serviceLens.toLowerCase());
+    lens = match
+      ? { accent: '#14B8A6', dim: false, label: serviceLens }
+      : { accent: '#CBD5E1', dim: true, label: '—' };
+  } else {
+    const lensStatus = data.lens ? resolveLensStatus(data.lens, data) : null;
+    lens = lensStatus ? LENS[lensStatus] : null;
+  }
   const accent = lens ? lens.accent : baseC.border;
   const dim = lens?.dim && !selected;
 

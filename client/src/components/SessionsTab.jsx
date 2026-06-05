@@ -294,7 +294,11 @@ export default function SessionsTab({ focusStation = null, onFocusConsumed }) {
                   {aggregate.sessionCount} sessions · edge thickness = visit frequency · click a station to explore
                 </p>
               </div>
-              <MapLensControls lens={lens} onChange={setLens} />
+              <MapLensControls
+                lens={lens}
+                onChange={setLens}
+                services={[...new Set((aggregate.stations || []).flatMap((s) => s.services || []))].sort((a, b) => a.localeCompare(b))}
+              />
             </div>
             <SubwayMap
               stations={aggregate.stations}
@@ -344,12 +348,28 @@ const RISK_KEYS = new Set(RISK_LENSES.map((l) => l.key));
 const SELECT_CLASS =
   'text-xs font-medium text-gray-700 dark:text-gray-200 bg-gray-50 dark:bg-gray-800/60 border border-gray-200 dark:border-gray-700 rounded-lg pl-2.5 pr-7 py-1.5 focus:outline-none focus:ring-2 focus:ring-emerald-500/40 focus:border-emerald-500/50 cursor-pointer';
 
-function MapLensControls({ lens, onChange }) {
+function MapLensControls({ lens, onChange, services = [] }) {
   const coverageValue = lens && COVERAGE_KEYS.has(lens) ? lens : '';
   const riskValue = lens && RISK_KEYS.has(lens) ? lens : '';
+  const serviceValue = lens && lens.startsWith('service:') ? lens.slice('service:'.length) : '';
 
   return (
     <div className="flex items-center gap-2 flex-wrap shrink-0">
+      {services.length > 0 && (
+        <label className="flex items-center gap-1.5 text-xs text-gray-500 dark:text-gray-400">
+          Services
+          <select
+            value={serviceValue}
+            onChange={(e) => onChange(e.target.value ? `service:${e.target.value}` : null)}
+            className={SELECT_CLASS}
+          >
+            <option value="">None</option>
+            {services.map((s) => (
+              <option key={s} value={s}>{s}</option>
+            ))}
+          </select>
+        </label>
+      )}
       <label className="flex items-center gap-1.5 text-xs text-gray-500 dark:text-gray-400">
         Coverage
         <select
@@ -433,10 +453,18 @@ function MapLensLegend({ lens }) {
     ),
   };
 
+  const isService = typeof lens === 'string' && lens.startsWith('service:');
+  const svc = isService ? lens.slice('service:'.length) : null;
+
   return (
     <div className="px-6 py-2.5 border-t border-gray-100 dark:border-gray-800 flex items-center gap-4 text-xs text-gray-500 dark:text-gray-400 flex-wrap">
-      <span className="font-medium text-gray-600 dark:text-gray-300">{LENS_LABELS[lens]}:</span>
-      {COVERAGE_KEYS.has(lens) ? coverageLegend : riskLegend[lens]}
+      <span className="font-medium text-gray-600 dark:text-gray-300">{isService ? svc : LENS_LABELS[lens]}:</span>
+      {isService ? (
+        <>
+          <LegendItem color="#14B8A6" label={`calls ${svc}`} />
+          <LegendItem color="#CBD5E1" label="doesn't call it" dimmed />
+        </>
+      ) : COVERAGE_KEYS.has(lens) ? coverageLegend : riskLegend[lens]}
     </div>
   );
 }

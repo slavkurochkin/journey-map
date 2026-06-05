@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { X, RefreshCw, Check, AlertTriangle } from 'lucide-react';
+import McpServers from './McpServers.jsx';
 
 const PROVIDERS = [
   { id: 'anthropic', name: 'Anthropic · Claude', hint: 'Best quality for structured analysis.', key: 'ANTHROPIC_API_KEY' },
@@ -290,6 +291,8 @@ export default function SettingsModal({ open, onClose, onSaved }) {
               </div>
             )}
           </div>
+
+          <McpServers open={open} provider={provider} />
         </div>
 
         <div className="flex justify-end gap-2 px-5 py-4 border-t border-gray-100 dark:border-gray-800 sticky bottom-0 bg-white dark:bg-gray-900 rounded-b-2xl">

@@ -96,6 +96,14 @@ Your job: identify which stations are areas of concern for this change, and expl
 - Service unit coverage: each station's services[] entry has a unitTestCoverage status (covered/partial/none/null). If the change touches a service with weak unit coverage, raise the concern and name that service.
 - Trace evidence (ground truth — prefer over inference): a station's "traces" object reports what really happens at that step — servicesObserved (backend services actually called), downstreamCalls (concrete operations, e.g. "postgres: db.query stories"), p95Ms, and errorRate. If the change touches a service or downstream call that appears in a station's traces, treat it as a direct hit with HIGH confidence (the trace proves the dependency — you are not guessing). A station with a high errorRate or p95Ms that is affected by the change deserves a raised concern level and a monitoring check.
 - Documentation staleness: journeyDocs (PRD, Eng Design) and per-station designDocs each have an updatedAt date. If a relevant doc is old relative to the change, note that the spec/design may be stale and worth re-reviewing before implementing.
+- Author-stated CHANGE FACTS: the input may include a "CHANGE FACTS" block with the author's answers about how they're shipping the change. Treat these as ground truth and let them adjust your reasoning and checks:
+  - UI change = visual only → low risk to journey behavior; suggest a visual/screenshot regression check but do not escalate functional or data concerns. = flow/behavior → the journey path itself may change (steps added/removed/reordered); raise concern for affected stations and their e2e coverage, and verify downstream steps remain reachable. = no → no front-end journey impact from the UI.
+  - Backwards-compatible = no → treat contract/data-shape breakage as HIGH risk for every consumer of the changed endpoint; add explicit compatibility checks.
+  - Changes API response shape = yes → flag all stations consuming that endpoint for shape risk and recommend a contract test.
+  - Behind a feature flag = yes → note the flag as a mitigation (blast radius is gated and rollback-able via the flag) and add a targeting/rollout check; = no → there is no rollout safety net, so keep affected high-risk stations at full severity.
+  - Requires a DB migration = yes → add migration/back-fill and rollback checks and raise concern for stations reading the affected data.
+  - Rollout = all at once → higher immediate exposure; gradual/canary → note staged rollout reduces immediate blast radius (mention it as mitigation, don't drop the concern).
+  - "not sure"/"unsure" → do not over-weight; instead add a check to confirm that unknown before shipping.
 
 Concern levels (severity — how bad if it breaks):
 - "high": directly modifies an endpoint/service this station depends on, or breaks auth this station needs.
@@ -145,6 +153,19 @@ OUTPUT: Return ONLY valid JSON — no markdown fences, no surrounding text:
   "affectedFlows": ["string — a plain-language user flow affected"],
   "reviewFocus": ["string — what to scrutinize in code review"]
 }`;
+
+export const CLARIFYING_QUESTIONS_PROMPT = `You generate a SHORT set of clarifying questions about a proposed code CHANGE, to sharpen a downstream blast-radius / impact analysis. You are given the change and a brief summary of the application (journey steps, services, endpoints).
+
+Return the 2-4 questions whose answers would MOST change the impact analysis for THIS specific change. Strong questions are concrete and specific to the change and the app — e.g. for an auth change: "Does the token format or expiry change?"; for a list endpoint: "Does pagination or default ordering change?"; reference real services/endpoints from the summary when relevant.
+
+Rules:
+- Quick-select only: each question has 2-4 SHORT answer options the user taps (no free text). For yes/no questions, include "not sure" as the third option.
+- Do NOT ask about things already covered elsewhere: UI changes, API response-shape changes, backwards compatibility, DB migrations, feature-flag gating, or rollout strategy — assume those are already asked. Ask about something else.
+- Be specific — avoid generic questions that apply to any change.
+- 2-4 questions max. If there is nothing genuinely useful to ask, return an empty array.
+
+OUTPUT: Return ONLY valid JSON — no markdown fences, no surrounding text:
+{ "questions": [ { "key": "short_snake_slug", "label": "the question?", "options": ["short", "answers", "not sure"] } ] }`;
 
 export const TEST_PLAN_SYSTEM_PROMPT = `You are a senior test-automation architect. Given a code CHANGE and the AFFECTED STATIONS — each with its real captured API request/response samples, current test coverage, services (with unit-test status), and past incidents — produce a concrete, prioritized test plan to de-risk shipping the change.
 

@@ -2,7 +2,8 @@ import { Router } from 'express';
 import { randomUUID } from 'node:crypto';
 import db from '../db.js';
 import { aggregateResults, gatherStationContext, buildTestPlanContext } from '../services/stations.js';
-import { analyzeImpact, chatImpact, generateTestPlan } from '../services/llm.js';
+import { endpointKeyFromString } from '../services/endpoints.js';
+import { analyzeImpact, chatImpact, generateTestPlan, generateClarifyingQuestions } from '../services/llm.js';
 
 const router = Router();
 
@@ -18,16 +19,24 @@ const DOC_STALE_MS = 1000 * 60 * 60 * 24 * 180; // ~6 months
 // Attach per-station coverage + risk metadata so the map can render overlay lenses.
 function enrichMapContext(stations) {
   const covStmt = db.prepare('SELECT type, status FROM test_coverage WHERE session_id = ? AND station_id = ?');
-  const svcStmt = db.prepare('SELECT coverage FROM station_services WHERE session_id = ? AND station_id = ?');
+  const svcStmt = db.prepare('SELECT name, coverage FROM station_services WHERE session_id = ? AND station_id = ?');
   const incStmt = db.prepare('SELECT COUNT(*) AS c FROM incidents WHERE session_id = ? AND station_id = ?');
   const docStmt = db.prepare('SELECT updated_at FROM station_docs WHERE session_id = ? AND station_id = ?');
   const flagStmt = db.prepare('SELECT COUNT(*) AS c FROM feature_flags WHERE session_id = ? AND station_id = ?');
   const obsStmt = db.prepare('SELECT COUNT(*) AS c FROM observability WHERE session_id = ? AND station_id = ?');
+  const traceDirectStmt = db.prepare('SELECT spans FROM traces WHERE session_id = ? AND station_id = ?');
+  const traceByEndpointStmt = db.prepare('SELECT spans FROM traces WHERE endpoint = ?');
   const rank = { covered: 2, partial: 1, none: 0 };
+
+  const addTraceServices = (spansJson, set) => {
+    try { for (const sp of JSON.parse(spansJson)) if (sp.service && sp.service !== 'unknown') set.add(sp.service); }
+    catch { /* skip malformed */ }
+  };
 
   for (const st of stations) {
     const cov = {};
     const svcStatuses = [];
+    const services = new Set(); // backend services this station calls (manual + observed in traces)
     let incidentCount = 0;
     let docCount = 0;
     let hasStaleDocs = false;
@@ -39,8 +48,10 @@ function enrichMapContext(stations) {
         if (!(c.type in cov) || (rank[c.status] ?? 0) > (rank[cov[c.type]] ?? 0)) cov[c.type] = c.status;
       }
       for (const s of svcStmt.all(m.sessionId, m.stationId)) {
+        if (s.name) services.add(s.name);
         if (s.coverage) svcStatuses.push(s.coverage);
       }
+      for (const t of traceDirectStmt.all(m.sessionId, m.stationId)) addTraceServices(t.spans, services);
       incidentCount += incStmt.get(m.sessionId, m.stationId).c;
       flagCount += flagStmt.get(m.sessionId, m.stationId).c;
       obsCount += obsStmt.get(m.sessionId, m.stationId).c;
@@ -49,7 +60,11 @@ function enrichMapContext(stations) {
         if (d.updated_at && Date.now() - new Date(d.updated_at).getTime() > DOC_STALE_MS) hasStaleDocs = true;
       }
     }
+    for (const api of st.apis || []) {
+      for (const t of traceByEndpointStmt.all(endpointKeyFromString(api))) addTraceServices(t.spans, services);
+    }
 
+    st.services = [...services];
     st.coverage = cov;
 
     let su = null;
@@ -105,17 +120,35 @@ router.delete('/aggregate/overrides/:key', (req, res) => {
 });
 
 router.post('/impact', async (req, res) => {
-  const { query } = req.body;
+  const { query, facts, extraFacts } = req.body;
   if (!query?.trim()) return res.status(400).json({ error: 'query required' });
   const context = gatherStationContext();
   if (!context.stations.length) {
     return res.json({ summary: 'No sessions captured yet — record and save some journeys first.', concerns: [] });
   }
   try {
-    res.json(await analyzeImpact(query, context));
+    res.json(await analyzeImpact(query, context, facts, Array.isArray(extraFacts) ? extraFacts : []));
   } catch (err) {
     console.error('Impact analysis error:', err);
     res.status(500).json({ error: err.message || 'Impact analysis failed' });
+  }
+});
+
+// Model-proposed clarifying questions tailored to THIS change (slice-2 of Sharpen).
+router.post('/impact/questions', async (req, res) => {
+  const { query } = req.body;
+  if (!query?.trim()) return res.status(400).json({ error: 'query required' });
+  const ctx = gatherStationContext();
+  if (!ctx.stations.length) return res.json({ questions: [] });
+  const services = [...new Set(ctx.stations.flatMap((s) => (s.services || []).map((x) => x.name)))].slice(0, 30);
+  const endpoints = [...new Set(ctx.stations.flatMap((s) => s.apis || []))].slice(0, 40);
+  const steps = ctx.stations.map((s) => s.label).slice(0, 40);
+  const summary = `Journey steps: ${steps.join(', ')}\nServices: ${services.join(', ') || '(none)'}\nEndpoints: ${endpoints.join(', ') || '(none)'}`;
+  try {
+    res.json({ questions: await generateClarifyingQuestions(query, summary) });
+  } catch (err) {
+    console.error('Clarifying questions error:', err);
+    res.status(500).json({ error: err.message || 'Failed to generate questions' });
   }
 });
 
@@ -208,13 +241,15 @@ router.post('/impact/evals/:id/run', async (req, res) => {
 
 // ---- Saved / shareable impact reports ----
 router.post('/impact/reports', (req, res) => {
-  const { change, result, testPlan, title, thread } = req.body;
+  const { change, result, testPlan, title, thread, facts, dynamicQA } = req.body;
   if (!change?.trim() || !result) return res.status(400).json({ error: 'change and result required' });
   const id = randomUUID();
   const derived = (title?.trim()) || change.trim().split('\n')[0].slice(0, 80);
-  db.prepare('INSERT INTO impact_reports (id, title, change_text, result, test_plan, thread, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+  const factsJson = facts && typeof facts === 'object' && Object.keys(facts).length ? JSON.stringify(facts) : null;
+  const dynJson = Array.isArray(dynamicQA) && dynamicQA.length ? JSON.stringify(dynamicQA) : null;
+  db.prepare('INSERT INTO impact_reports (id, title, change_text, result, test_plan, thread, facts, dynamic_qa, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
     .run(id, derived, change.trim(), JSON.stringify(result), testPlan ? JSON.stringify(testPlan) : null,
-         Array.isArray(thread) && thread.length ? JSON.stringify(thread) : null, new Date().toISOString());
+         Array.isArray(thread) && thread.length ? JSON.stringify(thread) : null, factsJson, dynJson, new Date().toISOString());
   res.json({ id });
 });
 
@@ -234,6 +269,8 @@ router.get('/impact/reports/:id', (req, res) => {
     id: row.id, title: row.title, change: row.change_text,
     result: JSON.parse(row.result), testPlan: row.test_plan ? JSON.parse(row.test_plan) : null,
     thread: row.thread ? JSON.parse(row.thread) : [],
+    facts: row.facts ? JSON.parse(row.facts) : {},
+    dynamicQA: row.dynamic_qa ? JSON.parse(row.dynamic_qa) : [],
     createdAt: row.created_at,
   });
 });

@@ -131,7 +131,7 @@ reasoning and concrete checks, derived from real recorded journeys.
 - [x] Performance metrics per station (p50/p95 duration, error rate) derived from matched traces
 - [x] Trace facts feed impact analysis: per-station servicesObserved, downstreamCalls, p95Ms, errorRate added to the impact/chat/test-plan context; prompt treats traces as ground-truth, high-confidence evidence (new `trace` evidence type) — makes blast-radius reasoning evidence-backed rather than inferred
 - [ ] OTel collector integration / push ingest endpoint — deferred until there's a real instrumented app
-- [ ] Backend service map overlay on the journey map — deferred (chose trace-view-first slice)
+- [x] Backend service map overlay on the journey map — journey-scoped "Services" lens: aggregate map stations carry their services (manual + trace-observed); selecting a service highlights the journey steps that call it and dims the rest (not a standalone Jaeger DAG)
 - [ ] Docker Compose for multi-service setup — deferred (conflicts with "no Docker" infra decision; revisit if needed)
 - [ ] PostgreSQL migration — deferred (SQLite is fine until multi-user/SaaS)
 
@@ -156,17 +156,18 @@ from a registry, so external context flows in without per-source hardcoding. Con
   reviewable, and never silently authoritative** (propose, don't auto-commit).
 
 ### Deliverables
-- [ ] `mcp_servers` registry table `(id, name, url, auth_token, enabled)` + Settings panel CRUD
-- [ ] **Connector-first:** pass enabled remote servers to Anthropic's MCP connector
+- [x] `mcp_servers` registry table `(id, name, url, auth_token, enabled)` + Settings panel CRUD (auth_token never returned to the client — `hasToken` only)
+- [x] **Connector-first:** enabled remote servers passed to Anthropic's MCP connector
       (`mcp_servers` param + `anthropic-beta: mcp-client-2025-04-04`) in `transport()` —
-      zero client code; gate to the `anthropic` provider
-- [ ] Wire into `chatImpact` first, then optionally `analyzeImpact`
-- [ ] *Fallback (only if stdio/local servers or non-Anthropic providers needed):* self-hosted
-      MCP client host via `@modelcontextprotocol/sdk` — connect, aggregate tools with
-      `{server}__{tool}` namespacing, run the `tool_use` loop, isolate per-server failures
+      zero client code; gated to the `anthropic` provider
+- [x] Wired into `chatImpact` (attached on free-form/non-JSON turns only, so tool-use can't break structured output; text extracted across interleaved tool blocks)
+- [x] Self-hosted MCP client host (`@modelcontextprotocol/sdk`) for OpenAI/Ollama: connects
+      (Streamable HTTP → SSE fallback), aggregates allowlisted tools with `{server}__{tool}`
+      namespacing, runs the `tool_use` loop, isolates per-server failures. MCP now works on
+      all three providers (Anthropic via the hosted connector; OpenAI/Ollama via this loop).
 - [ ] Deterministic incident sync (PagerDuty REST → `derived_incidents` keyed by canonical
       station) as the hardwired Layer-2 example — feeds the impact eval replay
-- [ ] Per-server read-only / tool allowlisting (security)
+- [x] Per-server tool allowlisting (security): optional `allowed_tools` per server → connector `tool_configuration.allowed_tools`; blank = all tools. (A generic "read-only" toggle isn't enforceable without per-tool semantics; the allowlist is the concrete control.)
 
 ### Success Criteria
 A user adds a GitHub or Sentry MCP server in Settings and, with no further code, the impact
@@ -180,6 +181,78 @@ chat can call that server's tools to pull live context into its answers.
 
 ---
 
+## Phase 7 — Agentic Impact Engine (wrapper → agent)
+**Status:** `not started`
+**Goal:** Stop being an LLM wrapper. Today every AI feature in `server/services/llm.js`
+(`analyzeImpact`, `generateTestPlan`, `chatImpact`, `generateClarifyingQuestions`) is a
+single-shot call: dump the full `gatherStationContext()` into the cached system block, ask
+once, `parseJsonResponse()`, done. No loop, no decision about *what to look at*, no action in
+the world, no self-checking. This phase introduces the four things that separate an agent from
+a wrapper — **tools, a loop, verification, and memory** — starting with the highest-payoff one.
+
+### Why now (ties to existing risks)
+- **Context-scale wall** (see [vector-db decision]): one-shot dumps the entire station graph
+  every call. Tool-calling retrieval fixes this *without* a vector DB — structured tool calls
+  over the graph beat embeddings for "which station calls this endpoint."
+- **Trust problem** (critical-assessment #2): one-shot output is confident but unverifiable. A
+  critic/verification loop attacks this directly using the eval + feedback tables already built
+  in `server/routes/impact.js` (`eval_cases`, `concern_feedback`).
+- **Maintenance burden** (critical-assessment #1): an auto-derivation agent turns manual entry
+  into review (propose → human confirm).
+
+### Sequencing
+Slice 1 is the keystone — it builds the `tool_use` loop in `transport()` that **Phase 6 (MCP
+connector) also depends on**, so do Slice 1 before, or as the first step of, Phase 6. Slices
+2–4 layer on top and can be picked up independently afterward.
+- **Must-have:** Slice 1 (tool-using loop) + Slice 2 (critic) — together they turn the core
+  feature from wrapper into trustworthy agent. This is the phase's actual point.
+- **Later / opportunistic:** Slice 3 (write-and-run tests) and Slice 4 (auto-derivation) — high
+  value but larger surface (sandbox execution, per-source mapping); start once 1–2 land.
+
+### Slice 1 — Tool-using retrieval loop for impact `[must-have, do first]`
+Replace the "dump everything" pattern in `analyzeImpact` with a `tool_use` loop where the model
+*navigates* the graph instead of being spoon-fed it. Establishes the tool_use plumbing in
+`transport()` that Phase 6 (MCP connector) also needs.
+- [ ] Add a `tool_use` loop to `transport()` (Anthropic provider first; gate by provider)
+- [ ] Internal tool definitions backed by `stations.js`/`db.js`, not a context blob:
+  - `search_stations(query)` → matching station ids/labels
+  - `get_station(id)` → full detail (endpoints, services, coverage, incidents, traces)
+  - `get_downstream(id)` → stations after it via edges
+  - `find_endpoint_consumers(endpoint)` → who calls e.g. `POST /api/auth/login`
+  - `get_traces(stationId)` → ground-truth trace facts (`traceFactsFor`)
+- [ ] Loop: read CHANGE → model selects + pulls only relevant stations → reasons → emits concerns
+- [ ] Preserve existing smart-routing, prompt-caching, and app-level memoization
+- [ ] Cap tool-call iterations; log per-call tool usage alongside the existing `[llm]` cost line
+
+### Slice 2 — Verification / critic loop `[must-have]`
+- [ ] Critic pass: a second call re-checks each emitted concern against the actual station
+      context and drops/demotes unsupported ones before returning
+- [ ] Feed eval misses back in: inject "historically missed X-type stations for Y-type changes"
+      from `eval_cases` results into the next run (memory across runs)
+- [ ] Surface a per-run confidence/coverage note derived from the critic, not the generator
+
+### Slice 3 — Agentic test plan (write + run, not describe) `[later]`
+- [ ] Tool: `write_playwright_test(station)` using the real captured selectors
+- [ ] Tool: `run_test()` in a sandbox → observe pass/fail → fix → retry loop
+- [ ] Output a *green* test artifact, not a JSON description of one (upgrades `generateTestPlan`)
+
+### Slice 4 — Auto-derivation agent (attacks the maintenance burden) `[later]`
+- [ ] On session import, agent proposes services (from network hostnames), incident links, and
+      coverage — tagged by source, **propose-don't-commit**, human confirms (mirrors Phase 6
+      Layer-2 caution: derived data is reviewable, never silently authoritative)
+
+### Success Criteria
+- Impact analysis answers a change by fetching only the stations it needs (visible in tool-call
+  logs), and produces the same-or-better concerns than the one-shot version at lower token cost.
+- A measurable trust gain: critic-filtered runs improve precision on `concern_feedback` / recall
+  on `eval_cases` versus the one-shot baseline.
+
+### Out of Scope (for the first slice)
+- Multi-agent orchestration, planner/executor splits — one tool-use loop first.
+- Replacing the structured graph with embeddings (still deferred; see vector-db decision).
+
+---
+
 ## Infrastructure Decisions
 
 | Decision | Choice | Revisit at |
@@ -189,3 +262,4 @@ chat can call that server's tools to pull live context into its answers.
 | PostgreSQL | Only if going SaaS / multi-user | Phase 5 |
 | Chrome extension | Out of scope until P4 | Phase 4 |
 | MCP host | Connector-first (no client code); self-host only if stdio/non-Anthropic needed | Phase 6 |
+| Agent loop | Single `tool_use` loop in `transport()` (Anthropic first); shared by Phase 6 + 7 | Phase 7 |

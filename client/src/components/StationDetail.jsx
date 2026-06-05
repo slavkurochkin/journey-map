@@ -1,6 +1,7 @@
 import ScreenshotGallery from './ScreenshotGallery.jsx';
 import ApiRequestList from './ApiRequestList.jsx';
 import TraceList from './TraceList.jsx';
+import ActionList from './ActionList.jsx';
 import ServiceList from './ServiceList.jsx';
 import FeatureFlagList from './FeatureFlagList.jsx';
 import ObservabilityList from './ObservabilityList.jsx';
@@ -63,18 +64,13 @@ export default function StationDetail({ station, onClose, sessionId, stations, o
         <StationIdentity key={station.canonicalKey} station={station} others={aggregateStations} onChange={onIdentityChange} />
       )}
 
-      {station.actions?.length > 0 && (
-        <div>
-          <p className="text-xs font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-2">Actions</p>
-          <ul className="space-y-1.5">
-            {station.actions.map((a, i) => (
-              <li key={i} className="text-sm text-gray-700 dark:text-gray-300 flex gap-2">
-                <span className="text-gray-300 select-none shrink-0">›</span>
-                {a}
-              </li>
-            ))}
-          </ul>
-        </div>
+      {(station.actions?.length > 0 || (sessionId && !aggregateMappings)) && (
+        <ActionList
+          sessionId={sessionId}
+          stationId={station.id}
+          actions={station.actions || []}
+          editable={!!sessionId && !aggregateMappings}
+        />
       )}
 
       {station.apis?.length > 0 && (

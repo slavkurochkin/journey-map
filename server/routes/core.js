@@ -83,6 +83,20 @@ router.patch('/:id', (req, res) => {
   res.json({ ok: true, title: title.trim() });
 });
 
+// Edit a station's action steps within a saved session's result.
+router.patch('/:id/stations/:stationId/actions', (req, res) => {
+  const { actions } = req.body;
+  if (!Array.isArray(actions)) return res.status(400).json({ error: 'actions array required' });
+  const row = db.prepare('SELECT result FROM sessions WHERE id = ?').get(req.params.id);
+  if (!row) return res.status(404).json({ error: 'Session not found' });
+  const result = JSON.parse(row.result);
+  const station = (result.stations || []).find((s) => s.id === req.params.stationId);
+  if (!station) return res.status(404).json({ error: 'Station not found' });
+  station.actions = actions.map((a) => String(a).trim()).filter(Boolean);
+  db.prepare('UPDATE sessions SET result = ? WHERE id = ?').run(JSON.stringify(result), req.params.id);
+  res.json({ ok: true, actions: station.actions });
+});
+
 router.delete('/:id', (req, res) => {
   deleteSession(req.params.id);
   res.json({ ok: true });

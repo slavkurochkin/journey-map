@@ -1,8 +1,10 @@
 import Anthropic from '@anthropic-ai/sdk';
 import OpenAI from 'openai';
 import { createHash } from 'node:crypto';
-import { SYSTEM_PROMPT, IMPACT_SYSTEM_PROMPT, IMPACT_CHAT_SYSTEM_PROMPT, TEST_PLAN_SYSTEM_PROMPT } from './prompt.js';
+import { SYSTEM_PROMPT, IMPACT_SYSTEM_PROMPT, IMPACT_CHAT_SYSTEM_PROMPT, TEST_PLAN_SYSTEM_PROMPT, CLARIFYING_QUESTIONS_PROMPT } from './prompt.js';
 import { getSettings } from './settings.js';
+import { enabledMcpServers } from './mcp.js';
+import { buildMcpHost } from './mcpHost.js';
 import db from '../db.js';
 
 // Task routing as a *downgrade* that respects the Settings model as the ceiling:
@@ -10,7 +12,7 @@ import db from '../db.js';
 // always honor whatever model you picked in Settings. Anthropic-only (the cheap
 // model is a Claude ID) — other providers use the Settings model for everything.
 const CHEAP_MODEL = 'claude-haiku-4-5';
-const CHEAP_TASKS = new Set(['analyze', 'chat']); // structured extraction + conversational follow-ups
+const CHEAP_TASKS = new Set(['analyze', 'chat', 'questions']); // structured extraction + conversational follow-ups + clarifying questions
 
 // The model that will actually run for a given task, given the active settings.
 // Used by both transport() (to send it) and the memoization wrappers (to key on it).
@@ -120,6 +122,23 @@ function logUsage(label, provider, model, u) {
 // No model list to maintain, so both old and new models keep working.
 const OPENAI_TOKEN_PARAM = new Map(); // model → 'max_tokens' | 'max_completion_tokens'
 
+// Send a chat.completions request applying the right token-limit param (with the
+// learn-on-400 fallback), given a ready params object (model + messages + extras).
+async function openaiSend(client, params, maxTokens, tokenParam = 'auto') {
+  if (tokenParam === 'max_tokens' || tokenParam === 'max_completion_tokens') {
+    return client.chat.completions.create({ ...params, [tokenParam]: maxTokens });
+  }
+  const param = OPENAI_TOKEN_PARAM.get(params.model) || 'max_tokens';
+  try {
+    return await client.chat.completions.create({ ...params, [param]: maxTokens });
+  } catch (err) {
+    const wantsNewParam = err?.param === 'max_tokens' || /max_completion_tokens/i.test(err?.message || '');
+    if (param !== 'max_tokens' || !wantsNewParam) throw err;
+    OPENAI_TOKEN_PARAM.set(params.model, 'max_completion_tokens');
+    return client.chat.completions.create({ ...params, max_completion_tokens: maxTokens });
+  }
+}
+
 async function openaiCreate(client, { model, system, messages, maxTokens, json, tokenParam = 'auto', temperature = null }) {
   const base = {
     model,
@@ -127,20 +146,36 @@ async function openaiCreate(client, { model, system, messages, maxTokens, json, 
     ...(temperature != null ? { temperature } : {}),
     messages: [{ role: 'system', content: system }, ...messages],
   };
-  // Forced mode: send exactly the param the user picked, no probing.
-  if (tokenParam === 'max_tokens' || tokenParam === 'max_completion_tokens') {
-    return client.chat.completions.create({ ...base, [tokenParam]: maxTokens });
+  return openaiSend(client, base, maxTokens, tokenParam);
+}
+
+// Self-hosted tool-use loop for OpenAI/Ollama: expose the MCP host's tools, let
+// the model call them, route each call back to the server, feed results in, repeat.
+const MCP_MAX_ITERS = 6;
+async function openaiToolLoop(client, { model, system, messages, maxTokens, temperature, tokenParam, host, label, provider }) {
+  const msgs = [{ role: 'system', content: system }, ...messages];
+  for (let i = 0; i < MCP_MAX_ITERS; i++) {
+    const params = { model, ...(temperature != null ? { temperature } : {}), tools: host.tools, messages: msgs };
+    const resp = await openaiSend(client, params, maxTokens, tokenParam);
+    logUsage(label, provider, model, resp.usage);
+    const m = resp.choices[0].message;
+    if (!m.tool_calls?.length) return m.content || '';
+    msgs.push(m);
+    for (const tc of m.tool_calls) {
+      let result;
+      try {
+        const args = tc.function.arguments ? JSON.parse(tc.function.arguments) : {};
+        result = await host.callTool(tc.function.name, args);
+        console.log(`[mcp] ${model} → ${tc.function.name}`);
+      } catch (e) {
+        result = `Error: ${e.message}`;
+      }
+      msgs.push({ role: 'tool', tool_call_id: tc.id, content: String(result) });
+    }
   }
-  // Auto: try the classic param, learn + retry with the new one on that 400.
-  const param = OPENAI_TOKEN_PARAM.get(model) || 'max_tokens';
-  try {
-    return await client.chat.completions.create({ ...base, [param]: maxTokens });
-  } catch (err) {
-    const wantsNewParam = err?.param === 'max_tokens' || /max_completion_tokens/i.test(err?.message || '');
-    if (param !== 'max_tokens' || !wantsNewParam) throw err;
-    OPENAI_TOKEN_PARAM.set(model, 'max_completion_tokens');
-    return client.chat.completions.create({ ...base, max_completion_tokens: maxTokens });
-  }
+  // Iteration cap reached — force a final answer without tools.
+  const final = await openaiSend(client, { model, ...(temperature != null ? { temperature } : {}), messages: msgs }, maxTokens, tokenParam);
+  return final.choices[0].message.content || '';
 }
 
 // Single transport. `system` is the system prompt; `messages` are user/assistant
@@ -154,15 +189,26 @@ async function transport({ system, messages, maxTokens = 4096, json = true, labe
 
   if (provider === 'anthropic') {
     const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-    const resp = await client.messages.create({
+    const params = {
       model,
       max_tokens: effMaxTokens,
       ...(temperature != null ? { temperature } : {}),
       system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }],
       messages,
-    });
+    };
+    // Connector-first MCP: let enabled remote servers' tools be called on free-form
+    // (non-JSON) turns — i.e. the impact chat. Skipped for JSON tasks so tool-use
+    // can't interrupt structured output. Zero client code; Anthropic-only.
+    let options;
+    const servers = !json ? enabledMcpServers() : [];
+    if (servers.length) {
+      params.mcp_servers = servers;
+      options = { headers: { 'anthropic-beta': 'mcp-client-2025-04-04' } };
+    }
+    const resp = await client.messages.create(params, options);
     logUsage(label, provider, model, resp.usage);
-    return resp.content[0].text;
+    // With MCP the response can interleave tool_use/tool_result blocks — collect text.
+    return resp.content.filter((b) => b.type === 'text').map((b) => b.text).join('') || '';
   }
 
   // openai | ollama — both speak the OpenAI chat API
@@ -172,6 +218,22 @@ async function transport({ system, messages, maxTokens = 4096, json = true, labe
       ? { baseURL: ollamaBaseUrl.replace(/\/$/, '') + '/v1', apiKey: 'ollama' }
       : { apiKey: process.env.OPENAI_API_KEY }
   );
+  // Self-hosted MCP host: on free-form (chat) turns, expose enabled servers' tools
+  // and run the tool-use loop ourselves (OpenAI/Ollama have no hosted connector).
+  // Per-server failures are isolated; if no tools come up, fall back to a plain call.
+  const servers = !json ? enabledMcpServers() : [];
+  if (servers.length) {
+    const host = await buildMcpHost(servers);
+    if (host.tools.length) {
+      try {
+        return await openaiToolLoop(client, { model, system, messages, maxTokens: effMaxTokens, temperature, tokenParam, host, label, provider });
+      } finally {
+        await host.close();
+      }
+    }
+    await host.close();
+  }
+
   const resp = await openaiCreate(client, {
     model, system, messages, maxTokens: effMaxTokens,
     json: json && forceJson, tokenParam, temperature,
@@ -194,15 +256,35 @@ export async function analyzeRecording(recording) {
 // so it goes in the cached system block (compact). Only the change query — which
 // varies and is tiny — stays in the user message. This makes re-runs / reworded
 // queries hit the prompt cache instead of re-billing the whole context.
-export async function analyzeImpact(query, context) {
+// Author-stated change-intent facts (the "Sharpen this analysis" answers) →
+// a readable block appended to the change. Treated as ground truth by the prompt.
+const FACT_LABELS = {
+  uiChange: 'UI change',
+  flag: 'Behind a feature flag',
+  backwardsCompatible: 'Backwards-compatible',
+  responseShape: 'Changes API response shape',
+  migration: 'Requires a DB migration',
+  rollout: 'Rollout strategy',
+};
+function factsBlock(facts, extraFacts = []) {
+  const lines = [];
+  if (facts && typeof facts === 'object') {
+    for (const [k, v] of Object.entries(facts)) if (v) lines.push(`- ${FACT_LABELS[k] ?? k}: ${v}`);
+  }
+  for (const l of extraFacts || []) if (l) lines.push(`- ${l}`); // model-generated clarifying answers, pre-labeled
+  return lines.length ? `\n\nCHANGE FACTS (stated by the author — treat as ground truth):\n${lines.join('\n')}` : '';
+}
+
+export async function analyzeImpact(query, context, facts = null, extraFacts = []) {
   const settings = getSettings();
-  const key = cacheKey(['impact', settings.provider, activeModelFor('impact', settings), settings.maxTokens, settings.temperature, query, context]);
+  const fb = factsBlock(facts, extraFacts);
+  const key = cacheKey(['impact', settings.provider, activeModelFor('impact', settings), settings.maxTokens, settings.temperature, query, fb, context]);
   const cached = getCached(key);
   if (cached) { console.log('[llm] impact · cache hit (app) · $0'); return cached; }
 
   const text = await transport({
     system: `${IMPACT_SYSTEM_PROMPT}\n\nAPPLICATION CONTEXT:\n${JSON.stringify(context)}`,
-    messages: [{ role: 'user', content: `CHANGE:\n${query}` }],
+    messages: [{ role: 'user', content: `CHANGE:\n${query}${fb}` }],
     label: 'impact',
   });
   const result = parseJsonResponse(text);
@@ -224,6 +306,22 @@ export async function generateTestPlan(change, context) {
   const result = parseJsonResponse(text);
   putCached(key, result);
   return result;
+}
+
+// Propose 2-4 quick-select clarifying questions tailored to THIS change.
+export async function generateClarifyingQuestions(query, summary) {
+  const text = await transport({
+    system: CLARIFYING_QUESTIONS_PROMPT,
+    messages: [{ role: 'user', content: `CHANGE:\n${query}\n\nAPP SUMMARY:\n${summary}` }],
+    maxTokens: 800,
+    label: 'questions',
+  });
+  const parsed = parseJsonResponse(text);
+  const qs = Array.isArray(parsed?.questions) ? parsed.questions : [];
+  return qs
+    .filter((q) => q?.label && Array.isArray(q.options) && q.options.length)
+    .slice(0, 4)
+    .map((q, i) => ({ key: q.key || `q${i}`, label: String(q.label), options: q.options.map(String).slice(0, 4) }));
 }
 
 export async function chatImpact(messages, context) {
