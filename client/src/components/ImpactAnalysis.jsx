@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import StationDetail from './StationDetail.jsx';
 import Icon from './Icon.jsx';
+import Markdown from './Markdown.jsx';
 
 const LEVEL = {
   high:   { label: 'High',   chip: 'bg-red-100 dark:bg-red-500/20 text-red-700 dark:text-red-300',    bar: 'bg-red-500',    card: 'border-red-200 dark:border-red-500/30' },
@@ -17,6 +18,7 @@ const EVIDENCE = {
   incident:       'bg-red-50 dark:bg-red-500/10 text-red-700 dark:text-red-300',
   'coverage-gap': 'bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-300',
   'doc-stale':    'bg-orange-50 dark:bg-orange-500/10 text-orange-700 dark:text-orange-300',
+  trace:          'bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-300',
 };
 
 const EXAMPLES = [
@@ -53,6 +55,7 @@ export default function ImpactAnalysis({ onViewOnMap, loadedReport = null }) {
   const [thread, setThread] = useState([]); // [{ role: 'user'|'assistant', text }]
   const [chatInput, setChatInput] = useState('');
   const [chatLoading, setChatLoading] = useState(false);
+  const [chatFormatted, setChatFormatted] = useState(true); // render replies as markdown
   const threadEndRef = useRef(null);
 
   const [votes, setVotes] = useState({}); // concernKey → 'up' | 'down'
@@ -72,7 +75,7 @@ export default function ImpactAnalysis({ onViewOnMap, loadedReport = null }) {
     setChange(loadedReport.change || '');
     setResult(loadedReport.result || null);
     setTestPlan(loadedReport.testPlan || null);
-    setThread([]); setVotes({}); setView('blast'); setSelected(null);
+    setThread(loadedReport.thread || []); setVotes({}); setView('blast'); setSelected(null);
     setSavedLink(null); setError(null);
     fetch('/api/sessions/aggregate/map')
       .then((r) => (r.ok ? r.json() : null))
@@ -87,7 +90,7 @@ export default function ImpactAnalysis({ onViewOnMap, loadedReport = null }) {
       const res = await fetch('/api/sessions/impact/reports', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ change, result, testPlan }),
+        body: JSON.stringify({ change, result, testPlan, thread }),
       });
       if (res.ok) {
         const { id } = await res.json();
@@ -570,24 +573,39 @@ export default function ImpactAnalysis({ onViewOnMap, loadedReport = null }) {
           {/* Right column — follow-up chat (sticky) */}
           <div className="bg-white dark:bg-gray-900 rounded-2xl border border-gray-200/70 dark:border-gray-800 shadow-soft p-5 flex flex-col lg:sticky lg:top-6"
                style={{ maxHeight: 'calc(100vh - 3rem)' }}>
-            <h3 className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-3 shrink-0">Ask about this change</h3>
+            <div className="flex items-center justify-between mb-3 shrink-0">
+              <h3 className="text-sm font-semibold text-gray-700 dark:text-gray-300">Ask about this change</h3>
+              {thread.length > 0 && (
+                <button
+                  onClick={() => setChatFormatted((v) => !v)}
+                  className="text-xs text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-300 transition-colors"
+                  title="Toggle markdown formatting"
+                >
+                  {chatFormatted ? 'Raw' : 'Formatted'}
+                </button>
+              )}
+            </div>
 
             <div className="flex-1 overflow-y-auto min-h-[8rem]">
               {thread.length > 0 ? (
                 <div className="space-y-3">
-                  {thread.map((msg, i) => (
-                    <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                      <div
-                        className={`max-w-[85%] rounded-2xl px-3.5 py-2 text-sm whitespace-pre-wrap leading-relaxed ${
-                          msg.role === 'user'
-                            ? 'bg-emerald-600 text-white rounded-br-sm'
-                            : 'bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300 rounded-bl-sm'
-                        }`}
-                      >
-                        {msg.text}
+                  {thread.map((msg, i) => {
+                    const isUser = msg.role === 'user';
+                    const showRaw = isUser || !chatFormatted;
+                    return (
+                      <div key={i} className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}>
+                        <div
+                          className={`max-w-[85%] rounded-2xl px-3.5 py-2 text-sm leading-relaxed ${showRaw ? 'whitespace-pre-wrap' : ''} ${
+                            isUser
+                              ? 'bg-emerald-600 text-white rounded-br-sm'
+                              : 'bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300 rounded-bl-sm'
+                          }`}
+                        >
+                          {showRaw ? msg.text : <Markdown text={msg.text} />}
+                        </div>
                       </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                   {chatLoading && (
                     <div className="flex justify-start">
                       <div className="bg-gray-100 dark:bg-gray-800 text-gray-400 dark:text-gray-500 rounded-2xl rounded-bl-sm px-3.5 py-2 text-sm">

@@ -9,18 +9,30 @@ const COV = {
   none:      { sym: '✕', title: 'unit coverage: none', cls: 'text-red-500' },
 };
 
-export default function ServiceList({ sessionId, stationId, sessionMappings, suggestions = [], onChange }) {
+export default function ServiceList({ sessionId, stationId, sessionMappings, suggestions = [], apis = [], onChange }) {
   const isAggregate = !!sessionMappings;
   const effectiveMappings = sessionMappings ?? (sessionId ? [{ sessionId, stationId }] : null);
   const [dismissed, setDismissed] = useState([]); // suggestion names dismissed this view
 
   const [services, setServices] = useState([]); // [{ id, name, coverage, sessionId }]
+  const [traceServices, setTraceServices] = useState([]); // service names observed in traces
   const [input, setInput] = useState('');
   const [adding, setAdding] = useState(false);
 
   useEffect(() => {
     if (effectiveMappings?.length) fetchServices();
   }, [sessionId, stationId, sessionMappings]);
+
+  // Observed services from uploaded traces (single-session editable view only).
+  useEffect(() => {
+    if (isAggregate || !sessionId || !stationId) { setTraceServices([]); return; }
+    const params = new URLSearchParams({ sessionId, stationId });
+    if (apis.length) params.set('endpoints', apis.map((a) => a).join(','));
+    fetch(`/api/sessions/trace-services?${params}`)
+      .then((r) => (r.ok ? r.json() : []))
+      .then(setTraceServices)
+      .catch(() => setTraceServices([]));
+  }, [sessionId, stationId, apis.join(','), isAggregate, services.length]);
 
   async function fetchServices() {
     const results = await Promise.all(
@@ -94,6 +106,13 @@ export default function ServiceList({ sessionId, stationId, sessionMappings, sug
     (s) => !addedNames.has(s.toLowerCase()) && !dismissed.includes(s.toLowerCase())
   );
 
+  // Services the traces prove this station calls but that aren't added yet (and
+  // aren't already covered by the network-call suggestion above).
+  const aiPending = new Set(pendingSuggestions.map((s) => s.toLowerCase()));
+  const traceSuggestions = isAggregate ? [] : traceServices.filter(
+    (s) => !addedNames.has(s.toLowerCase()) && !dismissed.includes(s.toLowerCase()) && !aiPending.has(s.toLowerCase())
+  );
+
   return (
     <div>
       <p className="text-xs font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-2">
@@ -131,7 +150,7 @@ export default function ServiceList({ sessionId, stationId, sessionMappings, sug
           })}
         </div>
       ) : (
-        pendingSuggestions.length === 0 && (
+        pendingSuggestions.length === 0 && traceSuggestions.length === 0 && (
           <p className="text-xs text-gray-300 italic mb-2">No services added for this station.</p>
         )
       )}
@@ -155,6 +174,35 @@ export default function ServiceList({ sessionId, stationId, sessionMappings, sug
                 <button
                   onClick={() => setDismissed((d) => [...d, name.toLowerCase()])}
                   className="text-teal-300 hover:text-teal-600 ml-0.5 leading-none transition-colors"
+                  title="Dismiss"
+                >×</button>
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Trace-observed services — ground truth from uploaded traces */}
+      {traceSuggestions.length > 0 && (
+        <div className="mb-2">
+          <p className="text-[11px] text-emerald-500 dark:text-emerald-400 mb-1 flex items-center gap-1">
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" /> Seen in traces — not yet added:
+          </p>
+          <div className="flex flex-wrap gap-1.5">
+            {traceSuggestions.map((name) => (
+              <span
+                key={name}
+                className="inline-flex items-center gap-1 text-xs text-emerald-700 dark:text-emerald-300 border border-dashed border-emerald-300 dark:border-emerald-500/40 bg-emerald-50/60 dark:bg-emerald-500/10 px-2 py-1 rounded-full"
+              >
+                <button
+                  onClick={() => confirmSuggestion(name)}
+                  className="font-bold hover:text-emerald-900 dark:hover:text-emerald-100 transition-colors"
+                  title="Add this service (observed in traces)"
+                >+</button>
+                {name}
+                <button
+                  onClick={() => setDismissed((d) => [...d, name.toLowerCase()])}
+                  className="text-emerald-300 hover:text-emerald-600 ml-0.5 leading-none transition-colors"
                   title="Dismiss"
                 >×</button>
               </span>

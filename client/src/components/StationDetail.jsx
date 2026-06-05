@@ -1,5 +1,6 @@
 import ScreenshotGallery from './ScreenshotGallery.jsx';
 import ApiRequestList from './ApiRequestList.jsx';
+import TraceList from './TraceList.jsx';
 import ServiceList from './ServiceList.jsx';
 import FeatureFlagList from './FeatureFlagList.jsx';
 import ObservabilityList from './ObservabilityList.jsx';
@@ -91,13 +92,15 @@ export default function StationDetail({ station, onClose, sessionId, stations, o
 
       <ApiRequestList apis={station.apis} sessionId={sessionId} stationId={station.id} />
 
+      <TraceList apis={station.apis} sessionId={sessionId} stationId={station.id} sessionMappings={aggregateMappings} />
+
       <ScreenshotGallery sessionMappings={aggregateMappings} sessionId={sessionId} stationId={station.id} stations={stations} />
 
       <StationDocs sessionMappings={aggregateMappings} sessionId={sessionId} stationId={station.id} />
 
       <CoverageBadges sessionMappings={aggregateMappings} sessionId={sessionId} stationId={station.id} />
 
-      <ServiceList sessionMappings={aggregateMappings} sessionId={sessionId} stationId={station.id} suggestions={station.suggestedServices} onChange={onServiceChange} />
+      <ServiceList sessionMappings={aggregateMappings} sessionId={sessionId} stationId={station.id} suggestions={station.suggestedServices} apis={station.apis} onChange={onServiceChange} />
 
       <FeatureFlagList sessionMappings={aggregateMappings} sessionId={sessionId} stationId={station.id} />
 

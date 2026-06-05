@@ -122,19 +122,21 @@ reasoning and concrete checks, derived from real recorded journeys.
 ---
 
 ## Phase 5 — OpenTelemetry Layer
-**Status:** `not started`
+**Status:** `in progress`
 **Goal:** Optionally connect frontend journeys to backend traces for engineering teams.
 
 ### Deliverables
-- [ ] OTel collector integration (optional, requires instrumented app)
-- [ ] Trace waterfall view inside station detail panel
-- [ ] Backend service map overlay on the journey map
-- [ ] Performance metrics per station (p50/p95 load times, error rates)
-- [ ] Docker Compose for multi-service setup
-- [ ] PostgreSQL migration (if going multi-user/SaaS)
+- [x] OTLP-JSON trace ingestion via upload (tolerant parser: `resourceSpans` or plain span array), stored in SQLite, matched to stations by endpoint signature (same model as api_requests)
+- [x] Trace waterfall view inside station detail panel (depth-indented spans, colored by service, errors in red)
+- [x] Performance metrics per station (p50/p95 duration, error rate) derived from matched traces
+- [x] Trace facts feed impact analysis: per-station servicesObserved, downstreamCalls, p95Ms, errorRate added to the impact/chat/test-plan context; prompt treats traces as ground-truth, high-confidence evidence (new `trace` evidence type) — makes blast-radius reasoning evidence-backed rather than inferred
+- [ ] OTel collector integration / push ingest endpoint — deferred until there's a real instrumented app
+- [ ] Backend service map overlay on the journey map — deferred (chose trace-view-first slice)
+- [ ] Docker Compose for multi-service setup — deferred (conflicts with "no Docker" infra decision; revisit if needed)
+- [ ] PostgreSQL migration — deferred (SQLite is fine until multi-user/SaaS)
 
 ### Success Criteria
-A station can show both the user action (frontend) and the full distributed trace (backend) in one panel.
+A station can show both the user action (frontend) and the full distributed trace (backend) in one panel. ✅ (via OTLP upload)
 
 ---
 

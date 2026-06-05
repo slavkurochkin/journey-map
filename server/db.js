@@ -130,6 +130,22 @@ migrate(`CREATE TABLE IF NOT EXISTS station_overrides (
   custom_label TEXT
 )`);
 migrate(`ALTER TABLE station_overrides ADD COLUMN color TEXT`);
+// Distributed traces (OTLP) attached to a station, matched cross-session by the
+// derived endpoint signature — same model as api_requests. Spans live in `spans`.
+migrate(`CREATE TABLE IF NOT EXISTS traces (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  station_id TEXT NOT NULL,
+  trace_id TEXT,
+  root_name TEXT,
+  endpoint TEXT,
+  duration_ms REAL,
+  start_time REAL,
+  status TEXT,
+  span_count INTEGER,
+  spans TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT 'upload'
+)`);
 // App-level result memoization: skip the model entirely on exact repeats.
 // Keyed on a hash of (label + provider + model + query + context), so any change
 // to the change text, the station context, or the model naturally misses.
@@ -148,6 +164,9 @@ migrate(`CREATE TABLE IF NOT EXISTS impact_reports (
   test_plan TEXT,
   created_at TEXT NOT NULL
 )`);
+// Follow-up Q&A saved alongside the report (JSON [{role,text}]). Forward-compatible:
+// per-message author/timestamp can be added later without a migration.
+migrate(`ALTER TABLE impact_reports ADD COLUMN thread TEXT`);
 
 // ---- Data migrations / cleanup (run once at startup) ----
 
@@ -166,7 +185,7 @@ migrate(`CREATE TABLE IF NOT EXISTS impact_reports (
 // Remove orphaned child rows from sessions deleted before cascade-delete existed
 (() => {
   const tables = ['screenshots', 'api_requests', 'station_services', 'feature_flags',
-                  'observability', 'incidents', 'test_coverage', 'station_docs'];
+                  'observability', 'incidents', 'test_coverage', 'station_docs', 'traces'];
   let removed = 0;
   for (const t of tables) {
     const r = db.prepare(`DELETE FROM ${t} WHERE session_id NOT IN (SELECT id FROM sessions)`).run();

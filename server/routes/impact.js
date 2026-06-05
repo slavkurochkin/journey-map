@@ -208,12 +208,13 @@ router.post('/impact/evals/:id/run', async (req, res) => {
 
 // ---- Saved / shareable impact reports ----
 router.post('/impact/reports', (req, res) => {
-  const { change, result, testPlan, title } = req.body;
+  const { change, result, testPlan, title, thread } = req.body;
   if (!change?.trim() || !result) return res.status(400).json({ error: 'change and result required' });
   const id = randomUUID();
   const derived = (title?.trim()) || change.trim().split('\n')[0].slice(0, 80);
-  db.prepare('INSERT INTO impact_reports (id, title, change_text, result, test_plan, created_at) VALUES (?, ?, ?, ?, ?, ?)')
-    .run(id, derived, change.trim(), JSON.stringify(result), testPlan ? JSON.stringify(testPlan) : null, new Date().toISOString());
+  db.prepare('INSERT INTO impact_reports (id, title, change_text, result, test_plan, thread, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(id, derived, change.trim(), JSON.stringify(result), testPlan ? JSON.stringify(testPlan) : null,
+         Array.isArray(thread) && thread.length ? JSON.stringify(thread) : null, new Date().toISOString());
   res.json({ id });
 });
 
@@ -232,6 +233,7 @@ router.get('/impact/reports/:id', (req, res) => {
   res.json({
     id: row.id, title: row.title, change: row.change_text,
     result: JSON.parse(row.result), testPlan: row.test_plan ? JSON.parse(row.test_plan) : null,
+    thread: row.thread ? JSON.parse(row.thread) : [],
     createdAt: row.created_at,
   });
 });

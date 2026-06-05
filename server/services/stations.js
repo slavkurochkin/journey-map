@@ -42,6 +42,41 @@ export function gatherStationContext() {
   const incStmt = db.prepare('SELECT description, occurred_at, severity FROM incidents WHERE session_id = ? AND station_id = ?');
   const covStmt = db.prepare('SELECT type, status FROM test_coverage WHERE session_id = ? AND station_id = ?');
   const docStmt = db.prepare('SELECT type, title, updated_at FROM station_docs WHERE session_id = ? AND station_id = ?');
+  const traceDirectStmt = db.prepare('SELECT id, duration_ms, status, spans FROM traces WHERE session_id = ? AND station_id = ?');
+  const traceByEndpointStmt = db.prepare('SELECT id, duration_ms, status, spans FROM traces WHERE endpoint = ?');
+
+  // Ground-truth facts from uploaded distributed traces: the services actually
+  // touched, concrete downstream calls, p95 latency, and error rate. These turn
+  // impact reasoning from "the model guessed" into "the trace proves it."
+  function traceFactsFor(st) {
+    const rows = new Map(); // dedupe by trace row id (direct + endpoint matches)
+    for (const m of st._mappings) for (const r of traceDirectStmt.all(m.sessionId, m.stationId)) rows.set(r.id, r);
+    for (const api of st.apis || []) for (const r of traceByEndpointStmt.all(endpointKeyFromString(api))) rows.set(r.id, r);
+    const list = [...rows.values()];
+    if (!list.length) return null;
+
+    const services = new Set();
+    const downstream = new Map(); // "service: operation" → count
+    for (const r of list) {
+      let spans;
+      try { spans = JSON.parse(r.spans); } catch { continue; }
+      for (const sp of spans) {
+        if (sp.service) services.add(sp.service);
+        const isDownstream = sp.kind === 'client' || sp.kind === 'producer' || /\b(db|sql|query|select|insert|update|fetch|http|grpc|rpc|call|publish|consume)\b/i.test(sp.name || '');
+        if (isDownstream && sp.name) downstream.set(`${sp.service}: ${sp.name}`, (downstream.get(`${sp.service}: ${sp.name}`) || 0) + 1);
+      }
+    }
+    const durs = list.map((r) => r.duration_ms).filter((v) => v != null).sort((a, b) => a - b);
+    const errors = list.filter((r) => r.status === 'error').length;
+    const p95 = durs.length ? durs[Math.min(durs.length - 1, Math.floor(0.95 * durs.length))] : null;
+    return {
+      traceCount: list.length,
+      servicesObserved: [...services].slice(0, 12),
+      downstreamCalls: [...downstream.keys()].slice(0, 6),
+      p95Ms: p95 != null ? Math.round(p95) : null,
+      errorRate: list.length ? Math.round((errors / list.length) * 100) : null,
+    };
+  }
 
   const stations = [...stationMap.values()].map((st) => {
     const serviceCov = new Map();
@@ -74,6 +109,7 @@ export function gatherStationContext() {
         docs.push({ type: d.type, title: d.title, updatedAt: d.updated_at });
       }
     }
+    const traces = traceFactsFor(st);
     return {
       id: st.id, label: st.label, domain: st.domain, actions: st.actions, apis: st.apis,
       services: [...serviceCov.entries()].map(([name, unitTestCoverage]) => ({ name, unitTestCoverage })),
@@ -82,6 +118,7 @@ export function gatherStationContext() {
       pastIncidents: incidents,
       testCoverage: Object.fromEntries(coverage),
       designDocs: docs,
+      ...(traces ? { traces } : {}),
     };
   });
 
@@ -129,6 +166,7 @@ export function buildTestPlanContext(stationLabels) {
       testCoverage: s.testCoverage,
       pastIncidents: s.pastIncidents,
       sampleRequests: samples,
+      ...(s.traces ? { traces: s.traces } : {}),
     };
   });
 }

@@ -69,7 +69,7 @@ OUTPUT: Return ONLY valid JSON — no markdown fences, no explanation, no surrou
 
 export const IMPACT_CHAT_SYSTEM_PROMPT = `You are an impact-analysis assistant for a web application. The user has described a code change and received an initial impact analysis. Now they ask follow-up questions.
 
-You are given the full APPLICATION CONTEXT: a graph of user-journey stations, each with endpoints, backend services (with unitTestCoverage), feature flags, observability links, past incidents, test coverage, and the edges between them.
+You are given the full APPLICATION CONTEXT: a graph of user-journey stations, each with endpoints, backend services (with unitTestCoverage), feature flags, observability links, past incidents, test coverage, the edges between them, and — where distributed traces were uploaded — a "traces" object (servicesObserved, downstreamCalls, p95Ms, errorRate) that is ground truth for what a step actually does.
 
 Answer follow-up questions grounded in this context. Be concrete and reference specific stations, services, endpoints, flags, or incidents by name. Good follow-ups you should handle well:
 - "What tests should be added?" → cite stations/services with missing or partial coverage and name the test type (e2e, contract, integration, unit).
@@ -83,7 +83,7 @@ Keep answers concise and skimmable. Use short paragraphs or bullet points. Respo
 
 export const IMPACT_SYSTEM_PROMPT = `You are an impact-analysis engine for a web application. You are given:
 1. A proposed CHANGE (e.g. "adding a field to the auth-service login endpoint")
-2. The application's CONTEXT: a graph of user-journey stations, each with its endpoints, backend services, feature flags, observability links, and the edges (flow) between them.
+2. The application's CONTEXT: a graph of user-journey stations, each with its endpoints, backend services, feature flags, observability links, and the edges (flow) between them. Some stations also carry a "traces" object derived from real distributed traces (ground truth).
 
 Your job: identify which stations are areas of concern for this change, and explain why. Reason about:
 - Direct hits: stations whose endpoints or services match the change.
@@ -94,6 +94,7 @@ Your job: identify which stations are areas of concern for this change, and expl
 - Past incidents: if a station has pastIncidents related to the change, raise its concern level and reference the prior incident in your reasoning — history tends to repeat.
 - Test coverage gaps: if an affected station has missing or partial testCoverage (e2e, contract, integration, unit-frontend), raise its concern level — untested code that changes is riskier. Call out which test type is missing in your checks.
 - Service unit coverage: each station's services[] entry has a unitTestCoverage status (covered/partial/none/null). If the change touches a service with weak unit coverage, raise the concern and name that service.
+- Trace evidence (ground truth — prefer over inference): a station's "traces" object reports what really happens at that step — servicesObserved (backend services actually called), downstreamCalls (concrete operations, e.g. "postgres: db.query stories"), p95Ms, and errorRate. If the change touches a service or downstream call that appears in a station's traces, treat it as a direct hit with HIGH confidence (the trace proves the dependency — you are not guessing). A station with a high errorRate or p95Ms that is affected by the change deserves a raised concern level and a monitoring check.
 - Documentation staleness: journeyDocs (PRD, Eng Design) and per-station designDocs each have an updatedAt date. If a relevant doc is old relative to the change, note that the spec/design may be stale and worth re-reviewing before implementing.
 
 Concern levels (severity — how bad if it breaks):
@@ -117,7 +118,8 @@ EVIDENCE (provenance): every concern MUST cite the specific context items that d
 - "incident": a relevant past incident (e.g. "Stories feed 500s (sev1)")
 - "coverage-gap": a missing/weak test (e.g. "no contract test", "auth-service: no unit tests")
 - "doc-stale": a relevant doc that may be outdated (e.g. "Checkout PRD · 8mo old")
-Include only evidence that genuinely applies. Aim for 1-4 items per concern.
+- "trace": a service/dependency/latency fact observed in the station's distributed traces (e.g. "trace: calls auth-svc", "postgres: db.query stories", "p95 420ms", "error rate 12%")
+Include only evidence that genuinely applies. Aim for 1-4 items per concern. When a trace fact is available for a concern, prefer it — it is the strongest evidence.
 
 SHIP-IT OUTPUTS: besides the blast-radius concerns, produce role-flexible outputs for the same change, derived from the SAME context (do not invent stations/services not in context):
 - monitorChecklist: what to watch after deploy. Reference the affected stations' observability links and past incidents where present.
@@ -135,7 +137,7 @@ OUTPUT: Return ONLY valid JSON — no markdown fences, no surrounding text:
       "level": "high|medium|low",
       "confidence": "high|medium|low",
       "reason": "string — why this station is affected by the change",
-      "evidence": [ { "type": "endpoint|service|downstream|flag|incident|coverage-gap|doc-stale", "detail": "string — the exact value from context" } ],
+      "evidence": [ { "type": "endpoint|service|downstream|flag|incident|coverage-gap|doc-stale|trace", "detail": "string — the exact value from context" } ],
       "checks": ["string — specific things to test or verify"]
     }
   ],
