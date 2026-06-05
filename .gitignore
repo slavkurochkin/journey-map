@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+
+# Secrets / environment
+.env
+.env.*
+!.env.example
+
+# Build output
+dist/
+
+# Database & persisted app data (sessions, screenshots, uploaded API requests)
+server/data/
+
+# Recorded sessions — these capture live network requests and contain
+# Authorization: Bearer tokens. Never commit real recordings.
+step-recording-*.json
+GET_api_stories*.json
+*.recording.json
+recordings/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp

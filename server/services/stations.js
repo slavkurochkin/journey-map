@@ -1,0 +1,134 @@
+import db from '../db.js';
+import { endpointKeyFromString } from './endpoints.js';
+import { canonicalKey, safeId } from './aggregate.js';
+
+// Pure aggregation helpers live in aggregate.js; re-export for existing importers.
+export { canonicalKey, safeId, aggregateResults } from './aggregate.js';
+
+// ---- DB-backed context for impact analysis ----
+
+// Merge all sessions into distinct stations, each enriched with services/flags/
+// observability/incidents/coverage/docs — the context for impact analysis.
+export function gatherStationContext() {
+  const sessions = db.prepare('SELECT id, result FROM sessions').all()
+    .map((r) => ({ sessionId: r.id, result: JSON.parse(r.result) }));
+
+  const stationMap = new Map();
+  const idToKey = new Map();
+  const edgeSet = new Set();
+
+  sessions.forEach(({ sessionId, result }, idx) => {
+    for (const st of result.stations) {
+      const sid = safeId(canonicalKey(st));
+      idToKey.set(`${idx}:${st.id}`, sid);
+      if (!stationMap.has(sid)) {
+        stationMap.set(sid, {
+          id: sid, label: st.label, domain: st.domain,
+          actions: st.actions || [], apis: st.apis || [], _mappings: [],
+        });
+      }
+      stationMap.get(sid)._mappings.push({ sessionId, stationId: st.id });
+    }
+    for (const e of result.edges) {
+      const s = idToKey.get(`${idx}:${e.source}`);
+      const t = idToKey.get(`${idx}:${e.target}`);
+      if (s && t && s !== t) edgeSet.add(`${s}→${t}`);
+    }
+  });
+
+  const svcStmt = db.prepare('SELECT name, coverage FROM station_services WHERE session_id = ? AND station_id = ?');
+  const flagStmt = db.prepare('SELECT name, enabled, rollout, description FROM feature_flags WHERE session_id = ? AND station_id = ?');
+  const obsStmt = db.prepare('SELECT type, label, url FROM observability WHERE session_id = ? AND station_id = ?');
+  const incStmt = db.prepare('SELECT description, occurred_at, severity FROM incidents WHERE session_id = ? AND station_id = ?');
+  const covStmt = db.prepare('SELECT type, status FROM test_coverage WHERE session_id = ? AND station_id = ?');
+  const docStmt = db.prepare('SELECT type, title, updated_at FROM station_docs WHERE session_id = ? AND station_id = ?');
+
+  const stations = [...stationMap.values()].map((st) => {
+    const serviceCov = new Map();
+    const flags = [];
+    const observability = [];
+    const incidents = [];
+    const docs = [];
+    const coverage = new Map();
+    const seenFlags = new Set();
+    const rank = { covered: 2, partial: 1, none: 0 };
+    for (const m of st._mappings) {
+      for (const s of svcStmt.all(m.sessionId, m.stationId)) {
+        const cur = serviceCov.get(s.name);
+        if (cur === undefined || (rank[s.coverage] ?? -1) > (rank[cur] ?? -1)) serviceCov.set(s.name, s.coverage || null);
+      }
+      for (const f of flagStmt.all(m.sessionId, m.stationId)) {
+        if (seenFlags.has(f.name.toLowerCase())) continue;
+        seenFlags.add(f.name.toLowerCase());
+        flags.push({ ...f, enabled: !!f.enabled });
+      }
+      for (const o of obsStmt.all(m.sessionId, m.stationId)) observability.push(o);
+      for (const inc of incStmt.all(m.sessionId, m.stationId)) {
+        incidents.push({ description: inc.description, occurredAt: inc.occurred_at, severity: inc.severity });
+      }
+      for (const c of covStmt.all(m.sessionId, m.stationId)) {
+        const cur = coverage.get(c.type);
+        if (!cur || (rank[c.status] ?? 0) > (rank[cur] ?? 0)) coverage.set(c.type, c.status);
+      }
+      for (const d of docStmt.all(m.sessionId, m.stationId)) {
+        docs.push({ type: d.type, title: d.title, updatedAt: d.updated_at });
+      }
+    }
+    return {
+      id: st.id, label: st.label, domain: st.domain, actions: st.actions, apis: st.apis,
+      services: [...serviceCov.entries()].map(([name, unitTestCoverage]) => ({ name, unitTestCoverage })),
+      featureFlags: flags,
+      observability,
+      pastIncidents: incidents,
+      testCoverage: Object.fromEntries(coverage),
+      designDocs: docs,
+    };
+  });
+
+  const edges = [...edgeSet].map((k) => {
+    const [source, target] = k.split('→');
+    return { source, target };
+  });
+
+  const journeyDocs = db.prepare('SELECT type, title, updated_at FROM journey_docs ORDER BY rowid ASC').all()
+    .map((d) => ({ type: d.type, title: d.title, updatedAt: d.updated_at }));
+
+  return { stations, edges, journeyDocs };
+}
+
+// Rich per-station context for the test plan: APIs, services+coverage, real
+// request/response samples (from auto-imported api_requests), incidents.
+export function buildTestPlanContext(stationLabels) {
+  const full = gatherStationContext().stations;
+  const wanted = new Set(stationLabels.map((l) => l.toLowerCase().trim()));
+  const chosen = wanted.size ? full.filter((s) => wanted.has(s.label.toLowerCase().trim())) : full;
+
+  const trim = (b) => (typeof b === 'string' && b.length > 1500 ? b.slice(0, 1500) + '…' : b);
+
+  return chosen.map((s) => {
+    const samples = [];
+    for (const api of s.apis || []) {
+      const key = endpointKeyFromString(api);
+      const rows = db.prepare('SELECT data FROM api_requests WHERE endpoint = ? LIMIT 2').all(key);
+      for (const r of rows) {
+        try {
+          const d = JSON.parse(r.data);
+          samples.push({
+            endpoint: `${d.method} ${api.replace(/^\S+\s/, '')}`,
+            status: d.status,
+            requestBody: trim(d.requestBody),
+            responseBody: trim(d.responseBody),
+          });
+        } catch { /* skip */ }
+      }
+    }
+    return {
+      station: s.label,
+      apis: s.apis,
+      services: s.services,
+      testCoverage: s.testCoverage,
+      pastIncidents: s.pastIncidents,
+      sampleRequests: samples,
+    };
+  });
+}

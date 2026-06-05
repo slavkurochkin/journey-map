@@ -1,0 +1,75 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --map-bg-from: #fcfcfd;
+    --map-bg-to: #f8fafc;
+    --map-dots: #cbd5e1;
+  }
+  .dark {
+    --map-bg-from: #0e1118;
+    --map-bg-to: #0a0c11;
+    --map-dots: #2a3242;
+  }
+
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+  body {
+    background:
+      radial-gradient(1200px 600px at 100% -10%, rgba(16, 185, 129, 0.06), transparent 60%),
+      radial-gradient(1000px 500px at -10% 0%, rgba(20, 184, 166, 0.05), transparent 55%),
+      #f6f7f9;
+    background-attachment: fixed;
+  }
+  .dark body {
+    background:
+      radial-gradient(1200px 600px at 100% -10%, rgba(16, 185, 129, 0.10), transparent 60%),
+      radial-gradient(1000px 500px at -10% 0%, rgba(20, 184, 166, 0.08), transparent 55%),
+      #0b0e14;
+  }
+}
+
+/* Pulse a station node when the map is asked to focus it (e.g. jumping from an
+   impact concern). Animated box-shadow overrides the node's inline shadow only
+   while the animation runs, then hands control back. */
+@keyframes station-pulse {
+  0%   { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.55); }
+  70%  { box-shadow: 0 0 0 12px rgba(16, 185, 129, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+}
+.station-pulse {
+  animation: station-pulse 1.2s ease-out 1.5;
+}
+
+@layer utilities {
+  /* Soft, layered shadows for a more modern card feel */
+  .shadow-soft {
+    box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04), 0 6px 20px rgba(16, 24, 40, 0.05);
+  }
+  .shadow-soft-lg {
+    box-shadow: 0 2px 4px rgba(16, 24, 40, 0.04), 0 16px 40px rgba(16, 24, 40, 0.08);
+  }
+  .dark .shadow-soft {
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 6px 20px rgba(0, 0, 0, 0.35);
+  }
+  .dark .shadow-soft-lg {
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.35), 0 16px 40px rgba(0, 0, 0, 0.45);
+  }
+}
+
+@layer components {
+  /* Primary CTA — subtle gradient + soft shadow */
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-1.5 text-sm font-medium text-white rounded-lg px-4 py-2 transition-all disabled:opacity-50 disabled:cursor-not-allowed;
+    background-image: linear-gradient(180deg, #10b981 0%, #059669 100%);
+    box-shadow: 0 1px 2px rgba(5, 150, 105, 0.25), 0 2px 8px rgba(5, 150, 105, 0.18);
+  }
+  .btn-primary:hover:not(:disabled) {
+    background-image: linear-gradient(180deg, #059669 0%, #047857 100%);
+  }
+}
