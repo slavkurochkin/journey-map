@@ -119,18 +119,29 @@ router.delete('/aggregate/overrides/:key', (req, res) => {
   res.json({ ok: true });
 });
 
+// Streams NDJSON: {type:'tool',...} per tool call, {type:'critic'}, then
+// {type:'result', result}. Lets the client show a live investigation trail.
 router.post('/impact', async (req, res) => {
   const { query, facts, extraFacts } = req.body;
   if (!query?.trim()) return res.status(400).json({ error: 'query required' });
   const context = gatherStationContext();
-  if (!context.stations.length) {
-    return res.json({ summary: 'No sessions captured yet — record and save some journeys first.', concerns: [] });
-  }
+
+  res.setHeader('Content-Type', 'application/x-ndjson');
+  res.setHeader('Cache-Control', 'no-cache');
+  const send = (obj) => res.write(JSON.stringify(obj) + '\n');
+
   try {
-    res.json(await analyzeImpact(query, context, facts, Array.isArray(extraFacts) ? extraFacts : []));
+    if (!context.stations.length) {
+      send({ type: 'result', result: { summary: 'No sessions captured yet — record and save some journeys first.', concerns: [] } });
+      return res.end();
+    }
+    const result = await analyzeImpact(query, context, facts, Array.isArray(extraFacts) ? extraFacts : [], send);
+    send({ type: 'result', result });
+    res.end();
   } catch (err) {
     console.error('Impact analysis error:', err);
-    res.status(500).json({ error: err.message || 'Impact analysis failed' });
+    send({ type: 'error', error: err.message || 'Impact analysis failed' });
+    res.end();
   }
 });
 
@@ -208,9 +219,27 @@ router.post('/impact/evals', (req, res) => {
   res.json({ id });
 });
 
+router.put('/impact/evals/:id', (req, res) => {
+  const { name, change, expected } = req.body;
+  if (!name?.trim() || !change?.trim() || !Array.isArray(expected) || !expected.length) {
+    return res.status(400).json({ error: 'name, change and a non-empty expected[] are required' });
+  }
+  const r = db.prepare('UPDATE eval_cases SET name = ?, change_text = ?, expected = ? WHERE id = ?')
+    .run(name.trim(), change.trim(), JSON.stringify(expected), req.params.id);
+  if (!r.changes) return res.status(404).json({ error: 'Eval case not found' });
+  res.json({ ok: true });
+});
+
 router.delete('/impact/evals/:id', (req, res) => {
   db.prepare('DELETE FROM eval_cases WHERE id = ?').run(req.params.id);
+  db.prepare('DELETE FROM eval_runs WHERE case_id = ?').run(req.params.id);
   res.json({ ok: true });
+});
+
+// Run history (one row per case per run) for the drift chart.
+router.get('/impact/evals/history', (req, res) => {
+  const rows = db.prepare('SELECT case_id, batch_id, recall, precision, created_at FROM eval_runs ORDER BY created_at ASC').all();
+  res.json(rows.map((r) => ({ caseId: r.case_id, batchId: r.batch_id, recall: r.recall, precision: r.precision, createdAt: r.created_at })));
 });
 
 router.post('/impact/evals/:id/run', async (req, res) => {
@@ -230,8 +259,11 @@ router.post('/impact/evals/:id/run', async (req, res) => {
     const extra = flagged.filter((f) => !expectedSet.has(norm(f)));
     const recall = Math.round((matched.length / expected.length) * 100);
     const precision = flagged.length ? Math.round((matched.length / flagged.length) * 100) : 0;
+    const now = new Date().toISOString();
     db.prepare('UPDATE eval_cases SET last_recall = ?, last_precision = ?, last_run_at = ? WHERE id = ?')
-      .run(recall, precision, new Date().toISOString(), row.id);
+      .run(recall, precision, now, row.id);
+    db.prepare('INSERT INTO eval_runs (id, case_id, batch_id, recall, precision, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(randomUUID(), row.id, req.body?.batchId || randomUUID(), recall, precision, now);
     res.json({ recall, precision, matched, missed, extra, flagged, expected });
   } catch (err) {
     console.error('Eval run error:', err);

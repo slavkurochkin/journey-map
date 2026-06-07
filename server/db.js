@@ -122,6 +122,16 @@ migrate(`CREATE TABLE IF NOT EXISTS eval_cases (
   last_run_at TEXT,
   created_at TEXT NOT NULL
 )`);
+// History of every eval run (one row per case per run), for the drift/degradation
+// chart. batch_id groups the cases run together by a single "Run all".
+migrate(`CREATE TABLE IF NOT EXISTS eval_runs (
+  id TEXT PRIMARY KEY,
+  case_id TEXT NOT NULL,
+  batch_id TEXT,
+  recall INTEGER,
+  precision INTEGER,
+  created_at TEXT NOT NULL
+)`);
 // User corrections to station identity in the aggregate map: merge a canonical
 // key into another, and/or give it a custom label.
 migrate(`CREATE TABLE IF NOT EXISTS station_overrides (

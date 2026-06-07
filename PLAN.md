@@ -213,25 +213,34 @@ connector) also depends on**, so do Slice 1 before, or as the first step of, Pha
 Replace the "dump everything" pattern in `analyzeImpact` with a `tool_use` loop where the model
 *navigates* the graph instead of being spoon-fed it. Establishes the tool_use plumbing in
 `transport()` that Phase 6 (MCP connector) also needs.
-- [ ] Add a `tool_use` loop to `transport()` (Anthropic provider first; gate by provider)
-- [ ] Internal tool definitions backed by `stations.js`/`db.js`, not a context blob:
-  - `search_stations(query)` → matching station ids/labels
-  - `get_station(id)` → full detail (endpoints, services, coverage, incidents, traces)
-  - `get_downstream(id)` → stations after it via edges
-  - `find_endpoint_consumers(endpoint)` → who calls e.g. `POST /api/auth/login`
-  - `get_traces(stationId)` → ground-truth trace facts (`traceFactsFor`)
-- [ ] Loop: read CHANGE → model selects + pulls only relevant stations → reasons → emits concerns
-- [ ] Preserve existing smart-routing, prompt-caching, and app-level memoization
-- [ ] Cap tool-call iterations; log per-call tool usage alongside the existing `[llm]` cost line
+- [x] `tool_use` loop for impact — `anthropicToolLoop` (native) + reuse of `openaiToolLoop`; works on **all three providers**, not just Anthropic (generalized since the loops already existed)
+- [x] Internal tool definitions (`services/impactTools.js`) backed by `gatherStationContext()`, not a context blob:
+  - `search_stations(query)`, `get_station(id)`, `get_downstream(id)`, `find_endpoint_consumers(endpoint)`, `get_traces(stationId)`
+- [x] Loop: read CHANGE → model searches + pulls only relevant stations → reasons → emits concerns (`runImpactAgent` + `IMPACT_AGENT_SYSTEM_PROMPT`)
+- [x] **Size-gated hybrid** (`shouldUseAgent`): `analyzeImpact` uses the one-shot (full graph in cached block — richer, holistic) when the graph fits (≤25 stations & <45KB), and the agent only for large graphs. At small scale the one-shot produced better/fuller output, so the agent is reserved for the scale it's actually for. Critic + memory + trail apply to both paths.
+- [x] **Degenerate-output guard:** the agent tracks the stations it fetches (`touched`); if its result is thin (no concerns, or empty ship-it lists), `analyzeImpact` re-synthesizes as a one-shot over JUST those candidate stations (fits even when the full graph doesn't) and swaps it in only if richer. Verified on a synthetic 44-station graph: agent produced full output (4 concerns + monitor/flows/review), guard stayed dormant; correctly skips when no candidates were fetched. Makes "will the agent go thin at scale?" a non-question.
+- [x] Preserved smart-routing, app-level memoization (key now `impact-agent`), and per-turn prompt caching (observed 60-85% cached reads across loop turns)
+- [x] Capped iterations (6) with a tool-free final answer; per-call tool usage logged as `[agent] <model> → <tool>` alongside the `[llm]` cost line
+- Verified live on `gpt-5.4-nano`: an auth→JWT change pulled Login + downstream Feed with `trace`/`downstream` evidence; a pagination change made 11 targeted tool calls.
+- Note: at the current ~10-station scale the agent makes more calls than the one-shot (cost is higher here); the win is architectural — it scales to large graphs the one-shot can't dump. Slice 2 (critic) is the remaining must-have.
 
-### Slice 2 — Verification / critic loop `[must-have]`
-- [ ] Critic pass: a second call re-checks each emitted concern against the actual station
-      context and drops/demotes unsupported ones before returning
-- [ ] Feed eval misses back in: inject "historically missed X-type stations for Y-type changes"
-      from `eval_cases` results into the next run (memory across runs)
-- [ ] Surface a per-run confidence/coverage note derived from the critic, not the generator
+### Slice 2 — Verification / critic loop `[must-have]` — **done**
+- [x] Critic pass (`critiqueConcerns` + `CRITIC_SYSTEM_PROMPT`): re-checks each concern against the
+      flagged stations' actual context and drops/demotes unsupported ones before returning. Non-fatal
+      on failure. Verified live: dropped an over-reaching "Load Stories Feed" concern with reasoning.
+- [x] Eval-miss memory (`evalMemoryHint`): injects expected stations from the most keyword-similar
+      low-recall `eval_cases` into the agent's first turn (memory across runs); folded into the cache key
+- [x] Per-run coverage note from the critic surfaced in the UI (`result.critique`: coverageNote + dropped/demoted counts)
+
+### Live investigation trail (UX) — **done**
+- [x] `/impact` streams NDJSON (`tool` per call → `critic` → `result`); agent loops thread an `onToolCall` callback. Client shows a live trail under the spinner (Claude-Code-style: "Searching stations · …", "Reading station · Login", "Checking traces · Login") and a collapsible "How it investigated (N steps)" on the result. Trail is saved inside `result.trail`, so shared reports show how the agent reached its conclusions.
+- [x] Hardened JSON parsing (balanced-brace `extractFirstJson`) + raised the agent's iteration cap to 12 — fixes "JSON + trailing prose" and search-loop exhaustion.
 
 ### Slice 3 — Agentic test plan (write + run, not describe) `[later]`
+> Built once (real Playwright generation + headless run + auto-fix loop + live highlight + per-test
+> results/screenshots/headed mode) then **removed as overkill** for the current scope. The existing
+> JSON "test plan" cards stay. Revisit if/when running real specs against the target app is worth the
+> Playwright dependency + sandbox surface.
 - [ ] Tool: `write_playwright_test(station)` using the real captured selectors
 - [ ] Tool: `run_test()` in a sandbox → observe pass/fail → fix → retry loop
 - [ ] Output a *green* test artifact, not a JSON description of one (upgrades `generateTestPlan`)
@@ -240,6 +249,12 @@ Replace the "dump everything" pattern in `analyzeImpact` with a `tool_use` loop 
 - [ ] On session import, agent proposes services (from network hostnames), incident links, and
       coverage — tagged by source, **propose-don't-commit**, human confirms (mirrors Phase 6
       Layer-2 caution: derived data is reviewable, never silently authoritative)
+
+> **Deferred idea — "Improvement Advisor"** (proactive "where should we improve, and why?", the
+> mirror of impact analysis) and the **automation roadmap** that gates it are written up in
+> [`docs/automation-and-improvement-advisor.md`](docs/automation-and-improvement-advisor.md).
+> Verdict: defer the advisor; invest in auto-deriving context first (trace push endpoint →
+> incident sync → LCOV). The advisor becomes worth building once context auto-populates at scale.
 
 ### Success Criteria
 - Impact analysis answers a change by fetching only the stations it needs (visible in tool-call

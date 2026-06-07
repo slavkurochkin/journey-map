@@ -1,5 +1,7 @@
 import { useState, useEffect } from 'react';
 import Icon from './Icon.jsx';
+import EvalChart, { EvalSparkline } from './EvalChart.jsx';
+import StationChips from './StationChips.jsx';
 
 function recallColor(r) {
   if (r == null) return 'text-gray-300';
@@ -14,6 +16,13 @@ export default function ImpactEvals() {
   const [running, setRunning] = useState({}); // caseId → bool
   const [results, setResults] = useState({}); // caseId → result detail
   const [runningAll, setRunningAll] = useState(false);
+  const [history, setHistory] = useState([]); // eval run history for the drift chart
+
+  const [editingId, setEditingId] = useState(null);
+  const [editName, setEditName] = useState('');
+  const [editChange, setEditChange] = useState('');
+  const [editExpected, setEditExpected] = useState([]);
+  const [savingEdit, setSavingEdit] = useState(false);
 
   const [showForm, setShowForm] = useState(false);
   const [name, setName] = useState('');
@@ -23,12 +32,18 @@ export default function ImpactEvals() {
 
   useEffect(() => {
     fetchCases();
+    fetchHistory();
     fetch('/api/sessions/aggregate/map').then((r) => (r.ok ? r.json() : null)).then((m) => setStations(m?.stations ?? []));
   }, []);
 
   async function fetchCases() {
     const res = await fetch('/api/sessions/impact/evals');
     if (res.ok) setCases(await res.json());
+  }
+
+  async function fetchHistory() {
+    const res = await fetch('/api/sessions/impact/evals/history');
+    if (res.ok) setHistory(await res.json());
   }
 
   async function handleCreate(e) {
@@ -45,24 +60,36 @@ export default function ImpactEvals() {
     setSaving(false);
   }
 
-  async function runCase(c) {
+  async function runCase(c, { refetch = true, batchId } = {}) {
     setRunning((r) => ({ ...r, [c.id]: true }));
     try {
-      const res = await fetch(`/api/sessions/impact/evals/${c.id}/run`, { method: 'POST' });
-      const data = await res.json();
-      if (res.ok) {
-        setResults((r) => ({ ...r, [c.id]: data }));
-        await fetchCases();
-      }
+      const res = await fetch(`/api/sessions/impact/evals/${c.id}/run`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ batchId: batchId || `single-${Date.now()}` }),
+      });
+      const data = await res.json().catch(() => ({ error: 'Bad response' }));
+      setResults((r) => ({ ...r, [c.id]: res.ok ? data : { error: data.error || `Run failed (${res.status})` } }));
+    } catch (err) {
+      // Never let one failed run abort a "Run all" batch.
+      setResults((r) => ({ ...r, [c.id]: { error: err.message || 'Run failed' } }));
     } finally {
       setRunning((r) => ({ ...r, [c.id]: false }));
+      if (refetch) { await fetchCases(); await fetchHistory(); }
     }
   }
 
   async function runAll() {
+    if (runningAll) return;
     setRunningAll(true);
-    for (const c of cases) await runCase(c);
-    setRunningAll(false);
+    const batchId = `all-${Date.now()}`;
+    try {
+      for (const c of cases) await runCase(c, { refetch: false, batchId });
+    } finally {
+      await fetchCases();
+      await fetchHistory();
+      setRunningAll(false);
+    }
   }
 
   async function remove(c) {
@@ -72,6 +99,34 @@ export default function ImpactEvals() {
 
   function toggleExpected(label) {
     setExpected((prev) => prev.includes(label) ? prev.filter((l) => l !== label) : [...prev, label]);
+  }
+
+  function startEdit(c) {
+    setEditingId(c.id);
+    setEditName(c.name);
+    setEditChange(c.change);
+    setEditExpected(c.expected);
+    setShowForm(false);
+  }
+
+  const toggleEditExpected = (label) =>
+    setEditExpected((prev) => prev.includes(label) ? prev.filter((l) => l !== label) : [...prev, label]);
+
+  async function saveEdit(e) {
+    e.preventDefault();
+    if (!editName.trim() || !editChange.trim() || !editExpected.length) return;
+    setSavingEdit(true);
+    try {
+      await fetch(`/api/sessions/impact/evals/${editingId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: editName, change: editChange, expected: editExpected }),
+      });
+      setEditingId(null);
+      await fetchCases();
+    } finally {
+      setSavingEdit(false);
+    }
   }
 
   const aggRecall = cases.filter((c) => c.lastRecall != null);
@@ -108,6 +163,14 @@ export default function ImpactEvals() {
         </div>
       </div>
 
+      {/* Drift chart */}
+      {history.length > 0 && (
+        <div className="bg-white dark:bg-gray-900 rounded-2xl border border-gray-200/70 dark:border-gray-800 shadow-soft px-4 py-3">
+          <p className="text-[11px] font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-1.5">Recall &amp; precision over time</p>
+          <EvalChart history={history} />
+        </div>
+      )}
+
       {/* New case */}
       <div className="bg-white dark:bg-gray-900 rounded-2xl border border-gray-200/70 dark:border-gray-800 shadow-soft p-5">
         <button
@@ -136,26 +199,7 @@ export default function ImpactEvals() {
               <p className="text-xs font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-1.5">
                 Expected stations ({expected.length})
               </p>
-              {stations.length === 0 ? (
-                <p className="text-xs text-gray-300 italic">No stations — record & save some journeys first.</p>
-              ) : (
-                <div className="flex flex-wrap gap-1.5">
-                  {stations.map((s) => (
-                    <button
-                      key={s.id}
-                      type="button"
-                      onClick={() => toggleExpected(s.label)}
-                      className={`text-xs px-2 py-1 rounded-full border transition-colors ${
-                        expected.includes(s.label)
-                          ? 'bg-emerald-600 text-white border-emerald-600'
-                          : 'bg-white dark:bg-gray-900 text-gray-600 dark:text-gray-400 border-gray-200 dark:border-gray-700 hover:border-emerald-300'
-                      }`}
-                    >
-                      {s.label}
-                    </button>
-                  ))}
-                </div>
-              )}
+              <StationChips stations={stations} selected={expected} onToggle={toggleExpected} />
             </div>
             <div className="flex justify-end">
               <button
@@ -176,35 +220,71 @@ export default function ImpactEvals() {
       ) : (
         cases.map((c) => {
           const result = results[c.id];
+          const caseHistory = history.filter((h) => h.caseId === c.id);
           return (
             <div key={c.id} className="bg-white dark:bg-gray-900 rounded-2xl border border-gray-200/70 dark:border-gray-800 shadow-soft p-5">
-              <div className="flex items-start gap-3">
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <h3 className="text-sm font-semibold text-gray-900 dark:text-gray-100">{c.name}</h3>
-                    {c.lastRecall != null && (
-                      <span className={`text-xs font-semibold ${recallColor(c.lastRecall)}`}>
-                        {c.lastRecall}% recall · {c.lastPrecision}% precision
-                      </span>
-                    )}
+              {editingId === c.id ? (
+                <form onSubmit={saveEdit} className="space-y-3">
+                  <input
+                    value={editName}
+                    onChange={(e) => setEditName(e.target.value)}
+                    placeholder="case name"
+                    className="w-full text-sm text-gray-700 dark:text-gray-300 bg-gray-50 dark:bg-gray-800/40 border border-gray-200 dark:border-gray-700 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-transparent"
+                  />
+                  <textarea
+                    value={editChange}
+                    onChange={(e) => setEditChange(e.target.value)}
+                    rows={2}
+                    placeholder="the change to analyze"
+                    className="w-full text-sm text-gray-700 dark:text-gray-300 bg-gray-50 dark:bg-gray-800/40 border border-gray-200 dark:border-gray-700 rounded-lg px-3 py-2 resize-none focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-transparent"
+                  />
+                  <div>
+                    <p className="text-xs font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-1.5">Expected stations ({editExpected.length})</p>
+                    <StationChips stations={stations} selected={editExpected} onToggle={toggleEditExpected} />
                   </div>
-                  <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">{c.change}</p>
-                  <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">expects: {c.expected.join(', ')}</p>
+                  <div className="flex justify-end gap-2">
+                    <button type="button" onClick={() => setEditingId(null)} className="text-sm font-medium px-3 py-1.5 rounded-lg text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800">Cancel</button>
+                    <button type="submit" disabled={savingEdit || !editName.trim() || !editChange.trim() || !editExpected.length} className="text-sm font-medium text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-40 px-4 py-1.5 rounded-lg transition-colors">
+                      {savingEdit ? 'Saving…' : 'Save'}
+                    </button>
+                  </div>
+                </form>
+              ) : (
+                <div className="flex items-start gap-3">
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <h3 className="text-sm font-semibold text-gray-900 dark:text-gray-100">{c.name}</h3>
+                      {c.lastRecall != null && (
+                        <span className={`text-xs font-semibold ${recallColor(c.lastRecall)}`}>
+                          {c.lastRecall}% recall · {c.lastPrecision}% precision
+                        </span>
+                      )}
+                      {caseHistory.length >= 2 && <EvalSparkline runs={caseHistory} />}
+                    </div>
+                    <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">{c.change}</p>
+                    <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">expects: {c.expected.join(', ')}</p>
+                  </div>
+                  <div className="flex items-center gap-2.5 shrink-0">
+                    <button
+                      onClick={() => runCase(c)}
+                      disabled={running[c.id]}
+                      className="text-xs font-medium text-emerald-600 dark:text-emerald-400 hover:text-emerald-800 disabled:opacity-40 transition-colors"
+                    >
+                      {running[c.id] ? 'Running…' : 'Run'}
+                    </button>
+                    <button onClick={() => startEdit(c)} className="text-xs font-medium text-gray-400 dark:text-gray-500 hover:text-emerald-600 transition-colors">Edit</button>
+                    <button onClick={() => remove(c)} className="text-gray-300 hover:text-red-400 text-sm leading-none transition-colors" title="Delete">×</button>
+                  </div>
                 </div>
-                <div className="flex items-center gap-2 shrink-0">
-                  <button
-                    onClick={() => runCase(c)}
-                    disabled={running[c.id]}
-                    className="text-xs font-medium text-emerald-600 dark:text-emerald-400 hover:text-emerald-800 disabled:opacity-40 transition-colors"
-                  >
-                    {running[c.id] ? 'Running…' : 'Run'}
-                  </button>
-                  <button onClick={() => remove(c)} className="text-gray-300 hover:text-red-400 text-sm leading-none transition-colors" title="Delete">×</button>
-                </div>
-              </div>
+              )}
 
               {/* Run result detail */}
-              {result && (
+              {editingId !== c.id && result?.error && (
+                <div className="mt-3 pt-3 border-t border-gray-100 dark:border-gray-800 text-xs text-red-500">
+                  ✕ {result.error}
+                </div>
+              )}
+              {editingId !== c.id && result && !result.error && (
                 <div className="mt-3 pt-3 border-t border-gray-100 dark:border-gray-800 space-y-1.5 text-xs">
                   {result.matched.length > 0 && (
                     <div className="flex gap-2">

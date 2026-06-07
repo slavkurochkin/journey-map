@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import StationDetail from './StationDetail.jsx';
 import Icon from './Icon.jsx';
 import Markdown from './Markdown.jsx';
+import StationChips from './StationChips.jsx';
 
 const LEVEL = {
   high:   { label: 'High',   chip: 'bg-red-100 dark:bg-red-500/20 text-red-700 dark:text-red-300',    bar: 'bg-red-500',    card: 'border-red-200 dark:border-red-500/30' },
@@ -43,6 +44,26 @@ const SHARPEN = [
   { key: 'flag',                label: 'Behind a feature flag?',      options: ['yes', 'no', 'not sure'] },
   { key: 'rollout',             label: 'Rollout',                     options: ['all at once', 'gradual', 'canary'] },
 ];
+// Friendly labels/icons for the live investigation trail (agent tool calls).
+const TOOL_LABEL = {
+  search_stations: 'Searching stations',
+  get_station: 'Reading station',
+  get_traces: 'Checking traces',
+  get_downstream: 'Following downstream',
+  find_endpoint_consumers: 'Finding endpoint consumers',
+  __synthesize: 'Synthesizing from candidates',
+  __critic: 'Reviewing concerns',
+};
+const TOOL_ICON = {
+  search_stations: 'endpoint',
+  get_station: 'square',
+  get_traces: 'trace',
+  get_downstream: 'downstream',
+  find_endpoint_consumers: 'endpoint',
+  __synthesize: 'target',
+  __critic: 'target',
+};
+
 const FACT_LABEL = Object.fromEntries(SHARPEN.map((q) => [q.key, q.label.replace(/\?$/, '')]));
 function factsToLines(answers) {
   return Object.entries(answers || {}).filter(([, v]) => v).map(([k, v]) => `${FACT_LABEL[k] ?? k}: ${v}`);
@@ -66,6 +87,8 @@ export default function ImpactAnalysis({ onViewOnMap, loadedReport = null }) {
   const [selected, setSelected] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [toolTrail, setToolTrail] = useState([]); // live agent investigation steps
+  const [showTrail, setShowTrail] = useState(false);
   const [editingChange, setEditingChange] = useState(false); // reopen the full change editor after results
   const [answers, setAnswers] = useState({}); // fixed "Sharpen" quick-select answers
   const [dynamicQ, setDynamicQ] = useState([]); // model-generated questions [{key,label,options,answer}]
@@ -109,6 +132,46 @@ export default function ImpactAnalysis({ onViewOnMap, loadedReport = null }) {
   const [savedLink, setSavedLink] = useState(null); // shareable URL after saving
   const [savingReport, setSavingReport] = useState(false);
   const [linkCopied, setLinkCopied] = useState(false);
+
+  // "Add to evals" — turn this analysis into a golden regression case
+  const [evalOpen, setEvalOpen] = useState(false);
+  const [evalName, setEvalName] = useState('');
+  const [evalExpected, setEvalExpected] = useState([]);
+  const [evalSaving, setEvalSaving] = useState(false);
+  const [evalSaved, setEvalSaved] = useState(false);
+
+  function openEval() {
+    // Pre-fill expected with flagged stations the user didn't thumb-down, that
+    // exist in the map — the vetted "should be flagged" set. Editable before save.
+    const labels = [];
+    for (const c of result?.concerns ?? []) {
+      const key = c.stationId || c.stationLabel;
+      if (votes[key] === 'down') continue;
+      if (stations.some((s) => s.label?.toLowerCase() === c.stationLabel?.toLowerCase())) labels.push(c.stationLabel);
+    }
+    setEvalName(change.trim().split('\n')[0].slice(0, 80));
+    setEvalExpected([...new Set(labels)]);
+    setEvalSaved(false);
+    setEvalOpen(true);
+  }
+
+  const toggleEvalExpected = (label) =>
+    setEvalExpected((prev) => (prev.includes(label) ? prev.filter((l) => l !== label) : [...prev, label]));
+
+  async function saveEval() {
+    if (!evalName.trim() || !evalExpected.length) return;
+    setEvalSaving(true);
+    try {
+      const res = await fetch('/api/sessions/impact/evals', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: evalName.trim(), change, expected: evalExpected }),
+      });
+      if (res.ok) { setEvalSaved(true); setTimeout(() => setEvalOpen(false), 1200); }
+    } finally {
+      setEvalSaving(false);
+    }
+  }
 
   // Hydrate from a saved/shared report (no LLM call) when one is opened.
   useEffect(() => {
@@ -257,23 +320,46 @@ export default function ImpactAnalysis({ onViewOnMap, loadedReport = null }) {
     setSavedLink(null);
     setEditingChange(false);
     setChange(query);
+    setToolTrail([]);
+    setShowTrail(false);
     const facts = cleanFacts(answers);
     setLastSig(factsSig());
+    const mapPromise = fetch('/api/sessions/aggregate/map').then((r) => (r.ok ? r.json() : null)).catch(() => null);
     try {
-      const [impactRes, mapRes] = await Promise.all([
-        fetch('/api/sessions/impact', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ query, facts, extraFacts: dynamicLines() }),
-        }),
-        fetch('/api/sessions/aggregate/map'),
-      ]);
-      if (!impactRes.ok) {
-        const err = await impactRes.json();
+      const res = await fetch('/api/sessions/impact', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query, facts, extraFacts: dynamicLines() }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
         throw new Error(err.error || 'Impact analysis failed');
       }
-      setResult(await impactRes.json());
-      const map = mapRes.ok ? await mapRes.json() : null;
+      // Read the NDJSON stream: tool/critic events live, then the final result.
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      let finalResult = null;
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let nl;
+        while ((nl = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, nl).trim();
+          buf = buf.slice(nl + 1);
+          if (!line) continue;
+          let ev;
+          try { ev = JSON.parse(line); } catch { continue; }
+          if (ev.type === 'tool') setToolTrail((t) => [...t, { tool: ev.tool, detail: ev.detail }]);
+          else if (ev.type === 'critic') setToolTrail((t) => [...t, { tool: '__critic' }]);
+          else if (ev.type === 'result') finalResult = ev.result;
+          else if (ev.type === 'error') throw new Error(ev.error);
+        }
+      }
+      if (!finalResult) throw new Error('No result returned');
+      setResult(finalResult);
+      const map = await mapPromise;
       setStations(map?.stations ?? []);
     } catch (err) {
       setError(err.message);
@@ -506,9 +592,25 @@ export default function ImpactAnalysis({ onViewOnMap, loadedReport = null }) {
       )}
 
       {loading && (
-        <div className="text-center py-16 text-gray-400 dark:text-gray-500">
-          <div className="inline-block w-6 h-6 border-2 border-emerald-500 border-t-transparent rounded-full animate-spin mb-3" />
-          <p className="text-sm">Tracing the blast radius across your journeys…</p>
+        <div className="bg-white dark:bg-gray-900 rounded-2xl border border-gray-200/70 dark:border-gray-800 shadow-soft p-6">
+          <div className="flex items-center gap-2.5 text-gray-600 dark:text-gray-300">
+            <div className="w-4 h-4 border-2 border-emerald-500 border-t-transparent rounded-full animate-spin shrink-0" />
+            <p className="text-sm">{toolTrail.length ? 'Investigating your journeys…' : 'Tracing the blast radius…'}</p>
+          </div>
+          {toolTrail.length > 0 && (
+            <ul className="mt-3 space-y-1.5">
+              {toolTrail.map((t, i) => {
+                const last = i === toolTrail.length - 1;
+                return (
+                  <li key={i} className={`flex items-center gap-2 text-xs transition-colors ${last ? 'text-gray-700 dark:text-gray-200' : 'text-gray-400 dark:text-gray-500'}`}>
+                    <Icon name={TOOL_ICON[t.tool] || 'square'} size={12} className={last ? 'text-emerald-500' : 'text-gray-300 dark:text-gray-600'} />
+                    <span>{TOOL_LABEL[t.tool] || t.tool}{t.detail ? <span className="text-gray-400 dark:text-gray-500"> · {t.detail}</span> : null}</span>
+                    {last && t.tool !== '__critic' && <span className="text-gray-300 dark:text-gray-600 animate-pulse">…</span>}
+                  </li>
+                );
+              })}
+            </ul>
+          )}
         </div>
       )}
 
@@ -532,6 +634,40 @@ export default function ImpactAnalysis({ onViewOnMap, loadedReport = null }) {
                     <span className="text-xs text-gray-400 dark:text-gray-500 ml-auto" title={`${stats.up} useful / ${stats.down} not, across ${stats.total} rated concerns`}>
                       {stats.precision}% rated useful · n={stats.total}
                     </span>
+                  )}
+                </div>
+              )}
+              {result.critique && (result.critique.coverageNote || result.critique.removed?.length || result.critique.demoted?.length) && (
+                <div className="mt-3 pt-3 border-t border-gray-100 dark:border-gray-800 flex items-start gap-1.5 text-xs text-gray-500 dark:text-gray-400">
+                  <Icon name="target" size={13} className="text-emerald-500 mt-0.5 shrink-0" />
+                  <span>
+                    <span className="font-medium text-gray-600 dark:text-gray-300">Reviewed by critic.</span>{' '}
+                    {result.critique.coverageNote}
+                    {(result.critique.removed?.length > 0 || result.critique.demoted?.length > 0) && (
+                      <span className="text-gray-400 dark:text-gray-500">
+                        {' · '}
+                        {result.critique.removed?.length > 0 && `dropped ${result.critique.removed.length} unsupported`}
+                        {result.critique.removed?.length > 0 && result.critique.demoted?.length > 0 && ', '}
+                        {result.critique.demoted?.length > 0 && `demoted ${result.critique.demoted.length}`}
+                      </span>
+                    )}
+                  </span>
+                </div>
+              )}
+              {result.trail?.length > 0 && (
+                <div className="mt-2">
+                  <button onClick={() => setShowTrail((v) => !v)} className="text-xs text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-300 transition-colors">
+                    {showTrail ? '▾' : '▸'} How it investigated ({result.trail.length} step{result.trail.length !== 1 ? 's' : ''})
+                  </button>
+                  {showTrail && (
+                    <ul className="mt-1.5 space-y-1">
+                      {result.trail.map((t, i) => (
+                        <li key={i} className="flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400">
+                          <Icon name={TOOL_ICON[t.tool] || 'square'} size={11} className="text-gray-300 dark:text-gray-600 shrink-0" />
+                          {TOOL_LABEL[t.tool] || t.tool}{t.detail ? ` · ${t.detail}` : ''}
+                        </li>
+                      ))}
+                    </ul>
                   )}
                 </div>
               )}
@@ -559,6 +695,11 @@ export default function ImpactAnalysis({ onViewOnMap, loadedReport = null }) {
                 <button onClick={saveReport} disabled={savingReport} className="text-xs font-medium text-emerald-600 dark:text-emerald-400 hover:text-emerald-800 transition-colors disabled:opacity-50">
                   {savingReport ? 'Saving…' : savedLink ? (linkCopied ? '✓ Link copied' : 'Saved') : 'Save & share'}
                 </button>
+                {stations.length > 0 && (
+                  <button onClick={openEval} className="text-xs font-medium text-emerald-600 dark:text-emerald-400 hover:text-emerald-800 transition-colors" title="Save as a golden regression eval case">
+                    Add to evals
+                  </button>
+                )}
               </div>
             </div>
 
@@ -805,6 +946,46 @@ export default function ImpactAnalysis({ onViewOnMap, loadedReport = null }) {
             onClick={(e) => e.stopPropagation()}
           >
             <StationDetail station={selected} onClose={() => setSelected(null)} />
+          </div>
+        </div>,
+        document.body
+      )}
+
+      {/* Add-to-evals modal */}
+      {evalOpen && createPortal(
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" onClick={() => setEvalOpen(false)}>
+          <div className="absolute inset-0 bg-gray-900/40 dark:bg-black/60 backdrop-blur-sm" />
+          <div onClick={(e) => e.stopPropagation()} className="relative w-full max-w-md bg-white dark:bg-gray-900 rounded-2xl shadow-soft-lg border border-gray-200/70 dark:border-gray-800 p-5 space-y-4 max-h-[88vh] overflow-y-auto">
+            <div>
+              <h3 className="text-base font-semibold text-gray-900 dark:text-gray-100">Add to evals</h3>
+              <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">Save this change as a golden regression case. The stations you pick are the ground truth that <em>should</em> be flagged.</p>
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Case name</label>
+              <input
+                value={evalName}
+                onChange={(e) => setEvalName(e.target.value)}
+                className="w-full text-sm text-gray-700 dark:text-gray-300 bg-gray-50 dark:bg-gray-800/40 border border-gray-200 dark:border-gray-700 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-transparent"
+              />
+            </div>
+
+            <div>
+              <p className="text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Change</p>
+              <p className="text-xs text-gray-500 dark:text-gray-400 bg-gray-50 dark:bg-gray-800/40 border border-gray-200 dark:border-gray-700 rounded-lg px-3 py-2 whitespace-pre-wrap line-clamp-3">{change}</p>
+            </div>
+
+            <div>
+              <p className="text-xs font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-1.5">Expected stations ({evalExpected.length}) <span className="normal-case font-normal text-gray-400">· pre-filled from this run</span></p>
+              <StationChips stations={stations} selected={evalExpected} onToggle={toggleEvalExpected} />
+            </div>
+
+            <div className="flex justify-end gap-2">
+              <button onClick={() => setEvalOpen(false)} className="text-sm font-medium px-4 py-2 rounded-lg text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800">Cancel</button>
+              <button onClick={saveEval} disabled={evalSaving || evalSaved || !evalName.trim() || !evalExpected.length} className="btn-primary px-5 disabled:opacity-50">
+                {evalSaved ? '✓ Added' : evalSaving ? 'Adding…' : 'Add case'}
+              </button>
+            </div>
           </div>
         </div>,
         document.body

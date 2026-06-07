@@ -1,10 +1,12 @@
 import Anthropic from '@anthropic-ai/sdk';
 import OpenAI from 'openai';
 import { createHash } from 'node:crypto';
-import { SYSTEM_PROMPT, IMPACT_SYSTEM_PROMPT, IMPACT_CHAT_SYSTEM_PROMPT, TEST_PLAN_SYSTEM_PROMPT, CLARIFYING_QUESTIONS_PROMPT } from './prompt.js';
+import { SYSTEM_PROMPT, IMPACT_SYSTEM_PROMPT, IMPACT_AGENT_SYSTEM_PROMPT, CRITIC_SYSTEM_PROMPT, IMPACT_CHAT_SYSTEM_PROMPT, TEST_PLAN_SYSTEM_PROMPT, CLARIFYING_QUESTIONS_PROMPT } from './prompt.js';
 import { getSettings } from './settings.js';
 import { enabledMcpServers } from './mcp.js';
 import { buildMcpHost } from './mcpHost.js';
+import { buildImpactTools } from './impactTools.js';
+import { evalMemoryHint } from './impactMemory.js';
 import db from '../db.js';
 
 // Task routing as a *downgrade* that respects the Settings model as the ceiling:
@@ -39,15 +41,38 @@ function putCached(key, result) {
     .run(key, JSON.stringify(result), new Date().toISOString());
 }
 
-// Tolerant JSON parse: local models often wrap output in prose or code fences,
-// so fall back to extracting the first {...} / [...] block.
+// Extract the first COMPLETE JSON object/array via brace matching (handles
+// trailing prose or a second block after the JSON — which a greedy regex botches).
+function extractFirstJson(s) {
+  const start = s.search(/[[{]/);
+  if (start < 0) return null;
+  const open = s[start];
+  const close = open === '{' ? '}' : ']';
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < s.length; i++) {
+    const ch = s[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === '\\') esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === open) depth++;
+    else if (ch === close && --depth === 0) return s.slice(start, i + 1);
+  }
+  return null;
+}
+
+// Tolerant JSON parse: models often wrap output in prose or code fences, or emit
+// a trailing block — fall back to the first complete {...} / [...].
 function parseJsonResponse(text) {
   const stripped = text.replace(/^```(?:json)?\s*/m, '').replace(/\s*```\s*$/m, '').trim();
   try {
     return JSON.parse(stripped);
   } catch {
-    const m = stripped.match(/[[{][\s\S]*[\]}]/);
-    if (m) return JSON.parse(m[0]);
+    const block = extractFirstJson(stripped);
+    if (block) return JSON.parse(block);
     throw new Error('Model did not return valid JSON');
   }
 }
@@ -152,9 +177,9 @@ async function openaiCreate(client, { model, system, messages, maxTokens, json, 
 // Self-hosted tool-use loop for OpenAI/Ollama: expose the MCP host's tools, let
 // the model call them, route each call back to the server, feed results in, repeat.
 const MCP_MAX_ITERS = 6;
-async function openaiToolLoop(client, { model, system, messages, maxTokens, temperature, tokenParam, host, label, provider }) {
+async function openaiToolLoop(client, { model, system, messages, maxTokens, temperature, tokenParam, host, label, provider, tag = 'tool', onToolCall, maxIters = MCP_MAX_ITERS }) {
   const msgs = [{ role: 'system', content: system }, ...messages];
-  for (let i = 0; i < MCP_MAX_ITERS; i++) {
+  for (let i = 0; i < maxIters; i++) {
     const params = { model, ...(temperature != null ? { temperature } : {}), tools: host.tools, messages: msgs };
     const resp = await openaiSend(client, params, maxTokens, tokenParam);
     logUsage(label, provider, model, resp.usage);
@@ -165,8 +190,9 @@ async function openaiToolLoop(client, { model, system, messages, maxTokens, temp
       let result;
       try {
         const args = tc.function.arguments ? JSON.parse(tc.function.arguments) : {};
+        onToolCall?.(tc.function.name, args);
         result = await host.callTool(tc.function.name, args);
-        console.log(`[mcp] ${model} → ${tc.function.name}`);
+        console.log(`[${tag}] ${model} → ${tc.function.name}`);
       } catch (e) {
         result = `Error: ${e.message}`;
       }
@@ -176,6 +202,66 @@ async function openaiToolLoop(client, { model, system, messages, maxTokens, temp
   // Iteration cap reached — force a final answer without tools.
   const final = await openaiSend(client, { model, ...(temperature != null ? { temperature } : {}), messages: msgs }, maxTokens, tokenParam);
   return final.choices[0].message.content || '';
+}
+
+// Anthropic-native tool_use loop (for internal tools, not the hosted MCP connector).
+async function anthropicToolLoop(client, { model, system, messages, maxTokens, temperature, tools, callTool, label, onToolCall, maxIters = MCP_MAX_ITERS }) {
+  const aTools = tools.map((t) => ({ name: t.function.name, description: t.function.description, input_schema: t.function.parameters }));
+  const msgs = [...messages];
+  for (let i = 0; i < maxIters; i++) {
+    const resp = await client.messages.create({
+      model,
+      max_tokens: maxTokens,
+      ...(temperature != null ? { temperature } : {}),
+      system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }],
+      tools: aTools,
+      messages: msgs,
+    });
+    logUsage(label, 'anthropic', model, resp.usage);
+    const toolUses = resp.content.filter((b) => b.type === 'tool_use');
+    if (!toolUses.length) return resp.content.filter((b) => b.type === 'text').map((b) => b.text).join('');
+    msgs.push({ role: 'assistant', content: resp.content });
+    const results = [];
+    for (const tu of toolUses) {
+      let out;
+      try { onToolCall?.(tu.name, tu.input || {}); out = await callTool(tu.name, tu.input || {}); console.log(`[agent] ${model} → ${tu.name}`); }
+      catch (e) { out = `Error: ${e.message}`; }
+      results.push({ type: 'tool_result', tool_use_id: tu.id, content: String(out) });
+    }
+    msgs.push({ role: 'user', content: results });
+  }
+  const final = await client.messages.create({
+    model, max_tokens: maxTokens,
+    ...(temperature != null ? { temperature } : {}),
+    system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }],
+    messages: msgs,
+  });
+  return final.content.filter((b) => b.type === 'text').map((b) => b.text).join('');
+}
+
+// Run the impact agent: the model navigates the journey graph via internal tools
+// (backed by gatherStationContext) instead of being handed the whole graph.
+async function runImpactAgent(userMessage, context, settings, onToolCall) {
+  const model = activeModelFor('impact', settings);
+  const maxTokens = settings.maxTokens || 4096;
+  const { temperature, provider } = settings;
+  const { tools, callTool, touched } = buildImpactTools(context);
+  const labels = (context.stations || []).map((s) => s.label).join(', ');
+  const messages = [{ role: 'user', content: `${userMessage}\n\nKnown journey steps: ${labels}\n\nInvestigate with the tools, then return ONLY the concerns JSON.` }];
+
+  let text;
+  if (provider === 'anthropic') {
+    const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    text = await anthropicToolLoop(client, { model, system: IMPACT_AGENT_SYSTEM_PROMPT, messages, maxTokens, temperature, tools, callTool, label: 'impact', onToolCall, maxIters: 12 });
+  } else {
+    const client = new OpenAI(
+      provider === 'ollama'
+        ? { baseURL: settings.ollamaBaseUrl.replace(/\/$/, '') + '/v1', apiKey: 'ollama' }
+        : { apiKey: process.env.OPENAI_API_KEY }
+    );
+    text = await openaiToolLoop(client, { model, system: IMPACT_AGENT_SYSTEM_PROMPT, messages, maxTokens, temperature, tokenParam: settings.tokenParam, host: { tools, callTool }, label: 'impact', provider, tag: 'agent', onToolCall, maxIters: 12 });
+  }
+  return { text, touched };
 }
 
 // Single transport. `system` is the system prompt; `messages` are user/assistant
@@ -226,7 +312,7 @@ async function transport({ system, messages, maxTokens = 4096, json = true, labe
     const host = await buildMcpHost(servers);
     if (host.tools.length) {
       try {
-        return await openaiToolLoop(client, { model, system, messages, maxTokens: effMaxTokens, temperature, tokenParam, host, label, provider });
+        return await openaiToolLoop(client, { model, system, messages, maxTokens: effMaxTokens, temperature, tokenParam, host, label, provider, tag: 'mcp' });
       } finally {
         await host.close();
       }
@@ -275,19 +361,147 @@ function factsBlock(facts, extraFacts = []) {
   return lines.length ? `\n\nCHANGE FACTS (stated by the author — treat as ground truth):\n${lines.join('\n')}` : '';
 }
 
-export async function analyzeImpact(query, context, facts = null, extraFacts = []) {
+// Impact analysis as a tool-using agent: the model navigates the journey graph
+// via internal tools (impactTools) rather than being handed the whole context.
+// Smart-routing, prompt-caching (per agent turn), and app-level memoization preserved.
+// A critic pass re-checks each generated concern against the actual flagged-station
+// context and drops/demotes unsupported ones — attacking the "confident but
+// unverifiable" trust problem. Failures are non-fatal (return the generator result).
+async function critiqueConcerns(change, result, context, settings) {
+  const concerns = result.concerns || [];
+  if (!concerns.length) return result;
+
+  const byId = new Map((context.stations || []).map((s) => [s.id, s]));
+  const byLabel = new Map((context.stations || []).map((s) => [s.label.toLowerCase(), s]));
+  const seen = new Set();
+  const flaggedCtx = [];
+  for (const c of concerns) {
+    const s = byId.get(c.stationId) || byLabel.get((c.stationLabel || '').toLowerCase());
+    if (s && !seen.has(s.id)) { seen.add(s.id); flaggedCtx.push(s); }
+  }
+
+  const payload = {
+    change,
+    concerns: concerns.map((c) => ({ stationLabel: c.stationLabel, level: c.level, confidence: c.confidence, reason: c.reason, evidence: c.evidence })),
+    context: flaggedCtx,
+  };
+  const text = await transport({
+    system: CRITIC_SYSTEM_PROMPT,
+    messages: [{ role: 'user', content: JSON.stringify(payload) }],
+    label: 'impact',
+  });
+  const critique = parseJsonResponse(text);
+
+  const verdicts = new Map((critique.verdicts || []).map((v) => [(v.stationLabel || '').toLowerCase(), v]));
+  const kept = [];
+  const removed = [];
+  const demoted = [];
+  for (const c of concerns) {
+    const v = verdicts.get((c.stationLabel || '').toLowerCase());
+    if (!v || v.verdict === 'keep') { kept.push(c); continue; }
+    if (v.verdict === 'drop') { removed.push(c.stationLabel); continue; }
+    if (v.verdict === 'demote') {
+      const from = c.level;
+      if (v.adjustedLevel) c.level = v.adjustedLevel;
+      if (v.adjustedConfidence) c.confidence = v.adjustedConfidence;
+      if (c.level !== from) demoted.push({ label: c.stationLabel, from, to: c.level });
+      kept.push(c);
+      continue;
+    }
+    kept.push(c);
+  }
+  result.concerns = kept;
+  result.critique = { coverageNote: critique.coverageNote || null, removed, demoted };
+  return result;
+}
+
+// Friendly one-line description of a tool call, for the live investigation trail.
+function toolDetail(tool, args, byId) {
+  switch (tool) {
+    case 'search_stations': return args?.query || '';
+    case 'find_endpoint_consumers': return args?.endpoint || '';
+    case 'get_station': return byId.get(args?.id)?.label || args?.id || '';
+    case 'get_traces': return byId.get(args?.stationId)?.label || args?.stationId || '';
+    case 'get_downstream': return byId.get(args?.id)?.label || args?.id || '';
+    default: return '';
+  }
+}
+
+// Use the tool-using agent only when the graph is too big to comfortably hand the
+// model in one shot. At small/medium scale the one-shot (full context in a cached
+// block) reasons more holistically and produces richer output — so prefer it.
+function shouldUseAgent(context) {
+  const stations = (context.stations || []).length;
+  const size = JSON.stringify(context).length;
+  return stations > 25 || size > 45000;
+}
+
+export async function analyzeImpact(query, context, facts = null, extraFacts = [], onEvent) {
+  assertConfigured();
   const settings = getSettings();
   const fb = factsBlock(facts, extraFacts);
-  const key = cacheKey(['impact', settings.provider, activeModelFor('impact', settings), settings.maxTokens, settings.temperature, query, fb, context]);
+  const memory = evalMemoryHint(query);
+  const useAgent = shouldUseAgent(context);
+  const key = cacheKey([useAgent ? 'impact-agent' : 'impact-oneshot', settings.provider, activeModelFor('impact', settings), settings.maxTokens, settings.temperature, query, fb, memory, context]);
   const cached = getCached(key);
   if (cached) { console.log('[llm] impact · cache hit (app) · $0'); return cached; }
 
-  const text = await transport({
-    system: `${IMPACT_SYSTEM_PROMPT}\n\nAPPLICATION CONTEXT:\n${JSON.stringify(context)}`,
-    messages: [{ role: 'user', content: `CHANGE:\n${query}${fb}` }],
+  const userMessage = `CHANGE:\n${query}${fb}${memory}`;
+  const trail = [];
+
+  // One-shot over a (possibly pruned) context — the rich, holistic path.
+  const oneShot = (ctx) => transport({
+    system: `${IMPACT_SYSTEM_PROMPT}\n\nAPPLICATION CONTEXT:\n${JSON.stringify(ctx)}`,
+    messages: [{ role: 'user', content: userMessage }],
     label: 'impact',
   });
-  const result = parseJsonResponse(text);
+  // "Thin" = no concerns, or none of the ship-it lists came back — a degenerate run.
+  const isThin = (r) => (r?.concerns?.length ?? 0) === 0 ||
+    ((r?.monitorChecklist?.length || 0) + (r?.affectedFlows?.length || 0) + (r?.reviewFocus?.length || 0)) === 0;
+
+  let result;
+  if (useAgent) {
+    const byId = new Map((context.stations || []).map((s) => [s.id, s]));
+    const onToolCall = (tool, args) => {
+      const step = { tool, detail: toolDetail(tool, args, byId) };
+      trail.push(step);
+      onEvent?.({ type: 'tool', ...step });
+    };
+    const { text, touched } = await runImpactAgent(userMessage, context, settings, onToolCall);
+    result = parseJsonResponse(text);
+
+    // Degenerate-output guard: if the agent went thin, re-synthesize as a one-shot
+    // over JUST the stations it fetched — fits even when the full graph doesn't, and
+    // restores holistic reasoning. Only swap in the retry if it's actually richer.
+    if (isThin(result)) {
+      const candidates = (context.stations || []).filter((s) => touched.has(s.id));
+      if (candidates.length) {
+        console.log(`[agent] thin output → re-synthesizing one-shot over ${candidates.length} candidate stations`);
+        onEvent?.({ type: 'tool', tool: '__synthesize', detail: `${candidates.length} candidate stations` });
+        const pruned = {
+          ...context,
+          stations: candidates,
+          edges: (context.edges || []).filter((e) => touched.has(e.source) && touched.has(e.target)),
+        };
+        try {
+          const retry = parseJsonResponse(await oneShot(pruned));
+          if (!isThin(retry)) result = retry;
+        } catch (err) {
+          console.warn('[agent] synthesis fallback failed:', err.message);
+        }
+      }
+    }
+  } else {
+    result = parseJsonResponse(await oneShot(context));
+  }
+
+  try {
+    onEvent?.({ type: 'critic' });
+    result = await critiqueConcerns(`${query}${fb}`, result, context, settings);
+  } catch (err) {
+    console.warn('[critic] skipped:', err.message);
+  }
+  result.trail = trail;
   putCached(key, result);
   return result;
 }
