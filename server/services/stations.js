@@ -1,9 +1,26 @@
 import db from '../db.js';
 import { endpointKeyFromString } from './endpoints.js';
-import { canonicalKey, safeId } from './aggregate.js';
+import { canonicalKey, safeId, applyActionOverrides } from './aggregate.js';
 
 // Pure aggregation helpers live in aggregate.js; re-export for existing importers.
 export { canonicalKey, safeId, aggregateResults } from './aggregate.js';
+
+// Recorded flag values are stored as JSON ("streamlined", false, true …); the
+// impact context reads better with the native value than a quoted string.
+function safeParseValue(s) { try { return JSON.parse(s); } catch { return s; } }
+
+// User corrections to the aggregate map (merge / rename / color / action edits),
+// keyed by canonical key. The single source the map and impact analysis both read.
+export function loadStationOverrides() {
+  const rows = db.prepare('SELECT canonical_key, merged_into, custom_label, color, actions FROM station_overrides').all();
+  const map = {};
+  for (const r of rows) {
+    let actions = null;
+    if (r.actions) { try { actions = JSON.parse(r.actions); } catch { /* ignore malformed */ } }
+    map[r.canonical_key] = { mergedInto: r.merged_into, customLabel: r.custom_label, color: r.color, actions };
+  }
+  return map;
+}
 
 // ---- DB-backed context for impact analysis ----
 
@@ -16,14 +33,16 @@ export function gatherStationContext() {
   const stationMap = new Map();
   const idToKey = new Map();
   const edgeSet = new Set();
+  const overrides = loadStationOverrides(); // so impact analysis honors map-level action edits
 
   sessions.forEach(({ sessionId, result }, idx) => {
     for (const st of result.stations) {
-      const sid = safeId(canonicalKey(st));
+      const ck = canonicalKey(st);
+      const sid = safeId(ck);
       idToKey.set(`${idx}:${st.id}`, sid);
       if (!stationMap.has(sid)) {
         stationMap.set(sid, {
-          id: sid, label: st.label, domain: st.domain,
+          id: sid, canonicalKey: ck, label: st.label, domain: st.domain,
           actions: st.actions || [], apis: st.apis || [], _mappings: [],
         });
       }
@@ -37,7 +56,8 @@ export function gatherStationContext() {
   });
 
   const svcStmt = db.prepare('SELECT name, coverage FROM station_services WHERE session_id = ? AND station_id = ?');
-  const flagStmt = db.prepare('SELECT name, enabled, rollout, description FROM feature_flags WHERE session_id = ? AND station_id = ?');
+  // Per-station flags plus any session-scoped flags (active across the whole journey).
+  const flagStmt = db.prepare("SELECT name, enabled, rollout, description, scope, provider, value FROM feature_flags WHERE session_id = ? AND (station_id = ? OR scope = 'session')");
   const obsStmt = db.prepare('SELECT type, label, url FROM observability WHERE session_id = ? AND station_id = ?');
   const incStmt = db.prepare('SELECT description, occurred_at, severity FROM incidents WHERE session_id = ? AND station_id = ?');
   const covStmt = db.prepare('SELECT type, status FROM test_coverage WHERE session_id = ? AND station_id = ?');
@@ -95,7 +115,7 @@ export function gatherStationContext() {
       for (const f of flagStmt.all(m.sessionId, m.stationId)) {
         if (seenFlags.has(f.name.toLowerCase())) continue;
         seenFlags.add(f.name.toLowerCase());
-        flags.push({ ...f, enabled: !!f.enabled });
+        flags.push({ ...f, enabled: !!f.enabled, value: f.value != null ? safeParseValue(f.value) : undefined });
       }
       for (const o of obsStmt.all(m.sessionId, m.stationId)) observability.push(o);
       for (const inc of incStmt.all(m.sessionId, m.stationId)) {
@@ -110,8 +130,9 @@ export function gatherStationContext() {
       }
     }
     const traces = traceFactsFor(st);
+    const { actions } = applyActionOverrides(st.actions, overrides[st.canonicalKey]?.actions);
     return {
-      id: st.id, label: st.label, domain: st.domain, actions: st.actions, apis: st.apis,
+      id: st.id, label: st.label, domain: st.domain, actions, apis: st.apis,
       services: [...serviceCov.entries()].map(([name, unitTestCoverage]) => ({ name, unitTestCoverage })),
       featureFlags: flags,
       observability,
@@ -166,6 +187,7 @@ export function buildTestPlanContext(stationLabels) {
       testCoverage: s.testCoverage,
       pastIncidents: s.pastIncidents,
       sampleRequests: samples,
+      ...(s.featureFlags?.length ? { featureFlags: s.featureFlags } : {}),
       ...(s.traces ? { traces: s.traces } : {}),
     };
   });

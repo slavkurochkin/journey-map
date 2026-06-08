@@ -1,18 +1,11 @@
 import { Router } from 'express';
 import { randomUUID } from 'node:crypto';
 import db from '../db.js';
-import { aggregateResults, gatherStationContext, buildTestPlanContext } from '../services/stations.js';
+import { aggregateResults, gatherStationContext, buildTestPlanContext, loadStationOverrides } from '../services/stations.js';
 import { endpointKeyFromString } from '../services/endpoints.js';
 import { analyzeImpact, chatImpact, generateTestPlan, generateClarifyingQuestions } from '../services/llm.js';
 
 const router = Router();
-
-function loadOverrides() {
-  const rows = db.prepare('SELECT canonical_key, merged_into, custom_label, color FROM station_overrides').all();
-  const map = {};
-  for (const r of rows) map[r.canonical_key] = { mergedInto: r.merged_into, customLabel: r.custom_label, color: r.color };
-  return map;
-}
 
 const DOC_STALE_MS = 1000 * 60 * 60 * 24 * 180; // ~6 months
 
@@ -86,7 +79,7 @@ function enrichMapContext(stations) {
 router.get('/aggregate/map', (req, res) => {
   const rows = db.prepare('SELECT id, result FROM sessions').all();
   if (!rows.length) return res.json(null);
-  const map = aggregateResults(rows.map((r) => ({ sessionId: r.id, result: JSON.parse(r.result) })), loadOverrides());
+  const map = aggregateResults(rows.map((r) => ({ sessionId: r.id, result: JSON.parse(r.result) })), loadStationOverrides());
   enrichMapContext(map.stations);
   res.json(map);
 });
@@ -97,20 +90,63 @@ router.put('/aggregate/overrides', (req, res) => {
   const { canonicalKey, mergedInto, customLabel, color } = req.body;
   if (!canonicalKey) return res.status(400).json({ error: 'canonicalKey required' });
 
-  const cur = db.prepare('SELECT merged_into, custom_label, color FROM station_overrides WHERE canonical_key = ?').get(canonicalKey) || {};
+  const cur = db.prepare('SELECT merged_into, custom_label, color, actions FROM station_overrides WHERE canonical_key = ?').get(canonicalKey) || {};
   const next = {
     merged_into: mergedInto !== undefined ? (mergedInto || null) : (cur.merged_into ?? null),
     custom_label: customLabel !== undefined ? (customLabel?.trim() || null) : (cur.custom_label ?? null),
     color: color !== undefined ? (color || null) : (cur.color ?? null),
+    actions: cur.actions ?? null, // preserved: never wiped by an identity edit
   };
 
-  if (!next.merged_into && !next.custom_label && !next.color) {
+  if (!next.merged_into && !next.custom_label && !next.color && !next.actions) {
     db.prepare('DELETE FROM station_overrides WHERE canonical_key = ?').run(canonicalKey);
     return res.json({ ok: true, cleared: true });
   }
   db.prepare(
-    'INSERT OR REPLACE INTO station_overrides (canonical_key, merged_into, custom_label, color) VALUES (?, ?, ?, ?)'
-  ).run(canonicalKey, next.merged_into, next.custom_label, next.color);
+    'INSERT OR REPLACE INTO station_overrides (canonical_key, merged_into, custom_label, color, actions) VALUES (?, ?, ?, ?, ?)'
+  ).run(canonicalKey, next.merged_into, next.custom_label, next.color, next.actions);
+  res.json({ ok: true });
+});
+
+// Edit (rename) or delete (hide) an action on an aggregated station, keyed by the
+// action's signature (sig from the map response). Persisted as an override — the
+// source recordings are never modified, and the edit survives re-aggregation.
+router.patch('/aggregate/overrides/:key/actions', (req, res) => {
+  const key = req.params.key;
+  const { op, sig, label } = req.body || {};
+  if (!op || !sig) return res.status(400).json({ error: 'op and sig required' });
+
+  const row = db.prepare('SELECT merged_into, custom_label, color, actions FROM station_overrides WHERE canonical_key = ?').get(key) || {};
+  let ao = { hidden: [], renames: {} };
+  if (row.actions) { try { ao = { hidden: [], renames: {}, ...JSON.parse(row.actions) }; } catch { /* reset */ } }
+  const hidden = new Set(ao.hidden || []);
+  const renames = { ...(ao.renames || {}) };
+
+  if (op === 'hide') { hidden.add(sig); delete renames[sig]; }
+  else if (op === 'rename') {
+    const text = (label || '').trim();
+    if (!text) return res.status(400).json({ error: 'label required for rename' });
+    renames[sig] = text; hidden.delete(sig);
+  } else if (op === 'reset') { hidden.delete(sig); delete renames[sig]; }
+  else return res.status(400).json({ error: 'unknown op' });
+
+  const actions = (hidden.size || Object.keys(renames).length)
+    ? JSON.stringify({ hidden: [...hidden], renames })
+    : null;
+  const next = {
+    merged_into: row.merged_into ?? null,
+    custom_label: row.custom_label ?? null,
+    color: row.color ?? null,
+    actions,
+  };
+
+  if (!next.merged_into && !next.custom_label && !next.color && !next.actions) {
+    db.prepare('DELETE FROM station_overrides WHERE canonical_key = ?').run(key);
+    return res.json({ ok: true, cleared: true });
+  }
+  db.prepare(
+    'INSERT OR REPLACE INTO station_overrides (canonical_key, merged_into, custom_label, color, actions) VALUES (?, ?, ?, ?, ?)'
+  ).run(key, next.merged_into, next.custom_label, next.color, next.actions);
   res.json({ ok: true });
 });
 

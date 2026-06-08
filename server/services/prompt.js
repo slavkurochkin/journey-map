@@ -88,7 +88,7 @@ export const IMPACT_SYSTEM_PROMPT = `You are an impact-analysis engine for a web
 Your job: identify which stations are areas of concern for this change, and explain why. Reason about:
 - Direct hits: stations whose endpoints or services match the change.
 - Downstream effects: stations that come AFTER an affected station in the journey (via edges) and depend on its output.
-- Feature flags: if an affected station is gated by a flag, note the rollout/targeting risk.
+- Feature flags: if an affected station is gated by a flag, note the rollout/targeting risk. Read each flag's "description" — the author writes it to convey intent (e.g. a kill switch, an experiment variant, a maintenance banner). Let it shape your reasoning: a kill switch means disabling the flag is itself a high-impact action and a fast mitigation; an experiment variant means behavior differs by cohort; a session-scoped flag (scope: "session") is active across the whole journey, not just one step. Reference the description in your reason/checks when it matters.
 - Data-shape risk: if the change alters a response shape, flag stations consuming that endpoint.
 - Auth/session risk: changes to auth stations cascade to everything requiring authentication.
 - Past incidents: if a station has pastIncidents related to the change, raise its concern level and reference the prior incident in your reasoning — history tends to repeat.
@@ -248,6 +248,7 @@ Rules for a STRONG plan (this is the whole point — be specific, not generic):
 - Prioritize by risk: p0 = directly-changed endpoint/service that is untested or has weak coverage; p1 = important but partially covered; p2 = precautionary.
 - Choose the right type per test: contract (response shape/fields between consumer & provider), integration (service-to-service), e2e (user journey), unit (a service's logic).
 - Use coverage gaps: if a directly-affected service has no unit tests or a station has no contract test, that's a p0 test to add.
+- Use feature flags: an affected station may carry featureFlags (each with name, enabled, value, and a "description" stating intent). If a flag gates the changed behavior, add a test for BOTH states (flag on and off) and tie it to the description — e.g. a kill switch needs a flag-off regression test proving graceful degradation; an experiment variant needs each variant asserted. Use the served "value" as the current state to test against.
 - Only propose tests the change actually warrants. Do not pad. 4-10 focused tests is better than 20 generic ones.
 
 OUTPUT: Return ONLY valid JSON — no markdown fences, no surrounding text:

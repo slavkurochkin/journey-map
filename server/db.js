@@ -55,6 +55,14 @@ migrate(`CREATE TABLE IF NOT EXISTS feature_flags (
 )`);
 migrate(`ALTER TABLE feature_flags ADD COLUMN rollout TEXT`);
 migrate(`ALTER TABLE feature_flags ADD COLUMN description TEXT`);
+// Auto-sync provenance: where the flag came from and how it scopes.
+// source: 'manual' (added in the UI) | 'recording' (synced from a recording's featureFlags[])
+// scope:  'station' (pinned to a step) | 'session' (active across the journey, e.g. a load-time bootstrap read)
+// provider/value: captured from the recorded evaluation (e.g. LaunchDarkly · "streamlined")
+migrate(`ALTER TABLE feature_flags ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'`);
+migrate(`ALTER TABLE feature_flags ADD COLUMN scope TEXT NOT NULL DEFAULT 'station'`);
+migrate(`ALTER TABLE feature_flags ADD COLUMN provider TEXT`);
+migrate(`ALTER TABLE feature_flags ADD COLUMN value TEXT`);
 migrate(`CREATE TABLE IF NOT EXISTS observability (
   id TEXT PRIMARY KEY,
   session_id TEXT NOT NULL,
@@ -140,6 +148,9 @@ migrate(`CREATE TABLE IF NOT EXISTS station_overrides (
   custom_label TEXT
 )`);
 migrate(`ALTER TABLE station_overrides ADD COLUMN color TEXT`);
+// Per-canonical-station action edits applied at aggregation time (does NOT touch
+// the source recordings). JSON: { hidden: [sigKey…], renames: { sigKey: text } }.
+migrate(`ALTER TABLE station_overrides ADD COLUMN actions TEXT`);
 // Distributed traces (OTLP) attached to a station, matched cross-session by the
 // derived endpoint signature — same model as api_requests. Spans live in `spans`.
 migrate(`CREATE TABLE IF NOT EXISTS traces (

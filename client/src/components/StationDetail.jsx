@@ -66,10 +66,13 @@ export default function StationDetail({ station, onClose, sessionId, stations, o
 
       {(station.actions?.length > 0 || (sessionId && !aggregateMappings)) && (
         <ActionList
-          sessionId={sessionId}
+          sessionId={aggregateMappings ? undefined : sessionId}
           stationId={station.id}
+          canonicalKey={aggregateMappings && onIdentityChange ? station.canonicalKey : undefined}
           actions={station.actions || []}
-          editable={!!sessionId && !aggregateMappings}
+          actionKeys={station.actionKeys || []}
+          editable={(!!sessionId && !aggregateMappings) || (!!aggregateMappings && !!station.canonicalKey && !!onIdentityChange)}
+          onChange={aggregateMappings ? onIdentityChange : undefined}
         />
       )}
 

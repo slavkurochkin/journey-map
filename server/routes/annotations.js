@@ -80,11 +80,23 @@ router.delete('/:id/services/:serviceId', (req, res) => {
 router.get('/:id/flags', (req, res) => {
   const { stationId } = req.query;
   if (!stationId) return res.status(400).json({ error: 'stationId required' });
+  // Return this station's flags PLUS any session-scoped flags (e.g. a recorded
+  // bootstrap read) that apply to every step. Station flags first, then session.
   const rows = db.prepare(
-    'SELECT id, name, enabled, rollout, description FROM feature_flags WHERE session_id = ? AND station_id = ? ORDER BY rowid ASC'
+    `SELECT id, name, enabled, rollout, description, source, scope, provider, value
+     FROM feature_flags
+     WHERE session_id = ? AND (station_id = ? OR scope = 'session')
+     ORDER BY scope ASC, rowid ASC`
   ).all(req.params.id, stationId);
-  res.json(rows.map((r) => ({ ...r, enabled: !!r.enabled })));
+  res.json(rows.map((r) => ({
+    ...r,
+    enabled: !!r.enabled,
+    value: r.value != null ? safeParse(r.value) : null,
+  })));
 });
+
+// Stored flag values are JSON ("streamlined", false, true …); return them native.
+function safeParse(s) { try { return JSON.parse(s); } catch { return s; } }
 
 router.post('/:id/flags', (req, res) => {
   const { stationId, name, enabled = true, rollout = null, description = null } = req.body;

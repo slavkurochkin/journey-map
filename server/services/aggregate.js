@@ -16,6 +16,73 @@ export function safeId(key) {
   return key.replace(/[^a-zA-Z0-9]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
 }
 
+// Across sessions the model phrases the same step differently ("Click Login
+// button" vs "Click the 'Log In' button to submit credentials for admin@x.com"),
+// so an exact-string union still shows near-duplicates on a merged station.
+// Collapse them by a normalized significant-token signature: an action is
+// redundant when its core tokens are a subset of another action's — we keep the
+// most descriptive (superset) phrasing and drop the rest.
+const ACTION_STOPWORDS = new Set([
+  'the', 'a', 'an', 'to', 'into', 'for', 'of', 'in', 'on', 'at', 'with',
+  'and', 'or', 'as', 'from', 'by', 'then', 'this', 'that', 'your',
+]);
+
+function actionSignature(action) {
+  return new Set(
+    String(action)
+      .toLowerCase()
+      .replace(/\b[\w.+-]+@[\w.-]+\b/g, ' ')   // drop email addresses (keep quoted UI labels)
+      .replace(/\b(?:log|sign)\s*in\b/g, 'login')   // unify "log in" / "sign in"
+      .replace(/\b(?:log|sign)\s*out\b/g, 'logout')
+      .replace(/[^a-z0-9\s]/g, ' ')            // strip punctuation / path symbols
+      .split(/\s+/)
+      .filter((t) => t.length > 1 && !ACTION_STOPWORDS.has(t) && !/^\d+$/.test(t))
+  );
+}
+
+const isSubsetOf = (a, b) => {
+  for (const t of a) if (!b.has(t)) return false;
+  return true;
+};
+
+// Stable key for an action, derived from its significant-token signature so the
+// same step keeps the same key regardless of which phrasing dedup happens to pick
+// (and survives re-aggregation). Empty-signature actions fall back to exact text.
+export function actionSigKey(action) {
+  const sig = actionSignature(action);
+  return sig.size ? [...sig].sort().join(' ') : `=${String(action).toLowerCase().trim()}`;
+}
+
+// Apply a station's action override (hide / rename, keyed by sigKey) to a deduped
+// action list. Returns the visible actions plus their keys (for the edit UI).
+export function applyActionOverrides(deduped, override) {
+  const hidden = new Set(override?.hidden || []);
+  const renames = override?.renames || {};
+  const actions = [];
+  const actionKeys = [];
+  for (const a of deduped || []) {
+    const key = actionSigKey(a);
+    if (hidden.has(key)) continue;
+    actions.push(renames[key] ?? a);
+    actionKeys.push(key);
+  }
+  return { actions, actionKeys };
+}
+
+export function dedupeActions(actions) {
+  const items = (actions || []).map((a) => ({ a, sig: actionSignature(a) }));
+  // Largest signature first so a superset is always kept before its subsets.
+  const ordered = [...items].sort((x, y) => y.sig.size - x.sig.size || y.a.length - x.a.length);
+  const kept = [];
+  for (const item of ordered) {
+    if (item.sig.size === 0) { kept.push(item); continue; } // nothing to compare on
+    const redundant = kept.some((k) => k.sig.size > 0 && isSubsetOf(item.sig, k.sig));
+    if (!redundant) kept.push(item);
+  }
+  const keep = new Set(kept.map((k) => k.a));
+  return (actions || []).filter((a) => keep.has(a)); // preserve original order
+}
+
 // Follow merge pointers to the final key (cycle-guarded).
 function resolveKey(key, overrides) {
   let k = key;
@@ -91,16 +158,23 @@ export function aggregateResults(sessions, overrides = {}) {
       .filter((k) => overrides[k]?.mergedInto && k !== targetKey && resolveKey(k, overrides) === targetKey)
       .map((k) => ({ canonicalKey: k, label: overrides[k].customLabel || rawLabels.get(k) || k }));
 
-  const stations = Array.from(stationMap.values()).map(({ _isAnchor, ...s }) => ({
+  const stations = Array.from(stationMap.values()).map(({ _isAnchor, ...s }) => {
+    const { actions, actionKeys } = applyActionOverrides(
+      dedupeActions(actionsMap.get(s.canonicalKey) ?? s.actions),
+      overrides[s.canonicalKey]?.actions
+    );
+    return {
     ...s,
     label: overrides[s.canonicalKey]?.customLabel || s.label,
     color: overrides[s.canonicalKey]?.color || null,
-    actions: actionsMap.get(s.canonicalKey) ?? s.actions,
+    actions,
+    actionKeys,
     apis: apisMap.get(s.canonicalKey) ?? s.apis,
     durationMs: s.visitCount > 0 ? Math.round(s.totalDuration / s.visitCount) : 0,
     sessionMappings: mappingsMap.get(s.id) ?? [],
     mergedFrom: mergedFromFor(s.canonicalKey),
-  }));
+    };
+  });
 
   const counts = Array.from(edgeMap.values());
   const maxCount = counts.length ? Math.max(...counts) : 1;

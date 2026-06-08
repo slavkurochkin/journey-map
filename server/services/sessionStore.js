@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import db from '../db.js';
 import { extractScreenshots, dataUrlToBuffer } from './screenshots.js';
 import { extractApiRequests } from './apiRequests.js';
+import { extractFeatureFlags } from './featureFlags.js';
 import { endpointKey } from './endpoints.js';
 
 // Child tables that hang off a session — kept in sync on delete
@@ -32,6 +33,14 @@ export function saveSession(recording, result) {
     );
     for (const { stationId, data } of apiReqs) {
       insertReq.run(randomUUID(), id, stationId, JSON.stringify(data), endpointKey(data.method, data.url), 'recording');
+    }
+
+    const flags = extractFeatureFlags(recording, result.stations);
+    const insertFlag = db.prepare(
+      'INSERT INTO feature_flags (id, session_id, station_id, name, enabled, value, provider, scope, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    );
+    for (const f of flags) {
+      insertFlag.run(randomUUID(), id, f.stationId, f.name, f.enabled ? 1 : 0, f.value, f.provider, f.scope, 'recording');
     }
   }
 
