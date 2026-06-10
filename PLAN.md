@@ -167,6 +167,27 @@ from a registry, so external context flows in without per-source hardcoding. Con
       all three providers (Anthropic via the hosted connector; OpenAI/Ollama via this loop).
 - [ ] Deterministic incident sync (PagerDuty REST → `derived_incidents` keyed by canonical
       station) as the hardwired Layer-2 example — feeds the impact eval replay
+- [ ] **Linear bug sync → bugs-by-station** (second Layer-2 example) — pull Linear issues into
+      a `station_bugs` table `(id, station_canonical_key, linear_id, title, severity, status,
+      url, created_at, source, mapping_method, confirmed)` keyed by canonical station, refreshed
+      on demand. Better than DORA: station-native, serves the QA buyer ("where are the fragile
+      areas?"), and **auto-derived** — brings genuinely new external signal in, attacking the
+      manual-maintenance risk rather than adding to it.
+  - **The mapping is the whole game** (connecting Linear is the easy part). Layer it
+    *deterministic-first*, LLM only as a reviewable fallback:
+    1. *Convention map (preferred, deterministic):* user-defined Linear label / team / project /
+       component → canonical station. Reuses triage structure teams already keep. No LLM.
+    2. *Endpoint/service references (deterministic-ish):* match bugs that name an endpoint/service
+       to the stations that call it — reuse the existing signature matching (traces/api_requests).
+    3. *LLM-mediated (fallback only):* model suggests the station from bug text. Reintroduces the
+       unverifiable-data trust risk → **tagged by source, reviewable, propose-don't-commit**; user
+       confirms (`confirmed` flag, `mapping_method` records which path assigned it).
+  - **Payoffs once mapped:** new `bug`/`bug-density` evidence type in impact analysis ("Search:
+    8 open bugs, 2 high → regression-prone, raise concern + add tests"); unlocks the bug-density
+    **heatmap lens** on the map (the visual the user liked, now backed by real data); test plan
+    can prioritize stations with open high-severity bugs.
+  - Sibling to `incidents` (past prod incidents) but distinct semantics (open/known issues) —
+    keep separate; both can feed impact evidence.
 - [x] Per-server tool allowlisting (security): optional `allowed_tools` per server → connector `tool_configuration.allowed_tools`; blank = all tools. (A generic "read-only" toggle isn't enforceable without per-tool semantics; the allowlist is the concrete control.)
 
 ### Success Criteria

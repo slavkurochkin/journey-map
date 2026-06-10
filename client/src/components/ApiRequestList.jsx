@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import JsonDiffView from './JsonDiffView.jsx';
+import CollapsibleSection from './CollapsibleSection.jsx';
 
 const METHOD_STYLE = {
   GET:     'bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-300',
@@ -270,31 +271,28 @@ export default function ApiRequestList({ sessionId, stationId, apis = [] }) {
 
   if (!sessionId && !apis.length) return null;
 
-  return (
-    <div>
-      <div className="flex items-center justify-between mb-2">
-        <p className="text-xs font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide">
-          API Requests {requests.length > 0 && `(${requests.length})`}
-        </p>
-        <div className="flex gap-3">
-          {compareBase && (
-            <button onClick={clearCompare} className="text-xs text-gray-400 dark:text-gray-500 hover:text-gray-600 transition-colors">
-              Cancel compare
-            </button>
-          )}
-          {canUpload && (
-            <button
-              onClick={() => fileRef.current?.click()}
-              disabled={uploading}
-              className="text-xs text-emerald-500 hover:text-emerald-700 font-medium disabled:opacity-40 transition-colors"
-            >
-              {uploading ? 'Uploading…' : '+ Add'}
-            </button>
-          )}
-        </div>
-        <input ref={fileRef} type="file" accept=".json,application/json" className="hidden" onChange={handleUpload} />
-      </div>
+  const actions = (
+    <>
+      {compareBase && (
+        <button onClick={clearCompare} className="text-xs text-gray-400 dark:text-gray-500 hover:text-gray-600 transition-colors">
+          Cancel compare
+        </button>
+      )}
+      {canUpload && (
+        <button
+          onClick={() => fileRef.current?.click()}
+          disabled={uploading}
+          className="text-xs text-emerald-500 hover:text-emerald-700 font-medium disabled:opacity-40 transition-colors"
+        >
+          {uploading ? 'Uploading…' : '+ Add'}
+        </button>
+      )}
+      <input ref={fileRef} type="file" accept=".json,application/json" className="hidden" onChange={handleUpload} />
+    </>
+  );
 
+  return (
+    <CollapsibleSection title="API Requests" count={requests.length} storageKey="api-requests" defaultOpen={false} actions={actions}>
       {compareBase && !diffPair && (
         <p className="text-xs text-emerald-500 italic mb-2">
           Base selected — click <strong>Compare →</strong> on another request
@@ -330,6 +328,6 @@ export default function ApiRequestList({ sessionId, stationId, apis = [] }) {
           onAcceptNew={handleAcceptNew}
         />
       )}
-    </div>
+    </CollapsibleSection>
   );
 }

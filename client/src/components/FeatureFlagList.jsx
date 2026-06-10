@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import Icon from './Icon.jsx';
+import CollapsibleSection from './CollapsibleSection.jsx';
 
 export default function FeatureFlagList({ sessionId, stationId, sessionMappings }) {
   const isAggregate = !!sessionMappings;
@@ -98,9 +99,7 @@ export default function FeatureFlagList({ sessionId, stationId, sessionMappings 
   if (!effectiveMappings?.length) return null;
 
   return (
-    <div>
-      <p className="text-xs font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-2">Feature Flags</p>
-
+    <CollapsibleSection title="Feature Flags" count={flags.length} storageKey="feature-flags">
       {flags.length > 0 ? (
         <div className="space-y-1.5 mb-3">
           {flags.map((flag) => {
@@ -249,6 +248,6 @@ export default function FeatureFlagList({ sessionId, stationId, sessionMappings 
           />
         </form>
       )}
-    </div>
+    </CollapsibleSection>
   );
 }
