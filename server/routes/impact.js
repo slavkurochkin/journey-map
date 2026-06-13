@@ -2,8 +2,9 @@ import { Router } from 'express';
 import { randomUUID } from 'node:crypto';
 import db from '../db.js';
 import { aggregateResults, gatherStationContext, buildTestPlanContext, loadStationOverrides } from '../services/stations.js';
+import { withLayers, cumulativeConfigs } from '../services/contextLayers.js';
 import { endpointKeyFromString } from '../services/endpoints.js';
-import { analyzeImpact, chatImpact, generateTestPlan, generateClarifyingQuestions } from '../services/llm.js';
+import { analyzeImpact, chatImpact, generateTestPlan, generateClarifyingQuestions, activeImpactModel, withUsageCapture, impactCacheCount, clearImpactCache } from '../services/llm.js';
 
 const router = Router();
 
@@ -306,6 +307,169 @@ router.post('/impact/evals/:id/run', async (req, res) => {
     res.status(500).json({ error: err.message || 'Eval run failed' });
   }
 });
+
+// ---- Context-engineering experiment (recall/precision vs context layers) ----
+// Runs the whole eval set under the cumulative layer ladder (journey → +apis →
+// +services → …), holding the engine path constant (forced one-shot) so only the
+// context varies. Returns per-layer mean recall/precision + context size.
+// A fatal LLM error won't recover by retrying or continuing (bad key, no credit,
+// quota exhausted) — so the experiment should abort immediately, not grind through
+// dozens of doomed calls and draw a misleading 0% cliff.
+function isFatalLlmError(err) {
+  const m = (err?.message || '').toLowerCase();
+  if (err?.status === 401 || err?.status === 403) return true;
+  return /credit balance|insufficient_quota|\bquota\b|billing|payment required|api key|authentication|invalid x-api-key/.test(m);
+}
+function friendlyExperimentError(err) {
+  const m = err?.message || 'Experiment failed';
+  if (/credit balance|billing|payment/i.test(m)) return 'Anthropic credit balance too low — run aborted. Top up at console.anthropic.com → Plans & Billing, then re-run.';
+  if (/insufficient_quota|\bquota\b/i.test(m)) return 'Provider quota exceeded — run aborted. Check your plan/billing, then re-run.';
+  if (err?.status === 401 || /api key|authentication|invalid x-api-key/i.test(m)) return 'Authentication failed (invalid API key) — run aborted. Fix the key in server/.env and restart.';
+  return m;
+}
+
+// Streams NDJSON so the client sees per-layer progress (it's dozens of LLM calls):
+//   {type:'start', total, caseCount}
+//   {type:'layer-start', i, total, label}   (before each layer)
+//   {type:'step', step}                      (after each layer completes)
+//   {type:'done'} | {type:'error', error}
+router.post('/impact/experiment', async (req, res) => {
+  // Optional subset: run only the chosen cases (for demo clarity). Empty/absent → all.
+  const wanted = Array.isArray(req.body?.caseIds) && req.body.caseIds.length ? new Set(req.body.caseIds) : null;
+  const cases = db.prepare('SELECT * FROM eval_cases ORDER BY rowid ASC').all()
+    .map((c) => ({ ...c, expectedList: JSON.parse(c.expected || '[]') }))
+    .filter((c) => c.expectedList.length && (!wanted || wanted.has(c.id)));
+  if (!cases.length) return res.status(400).json({ error: 'Need at least one eval case with expected stations' });
+
+  const fullContext = gatherStationContext();
+  if (!fullContext.stations.length) return res.status(400).json({ error: 'No sessions captured to analyze against' });
+
+  // Average over N runs to smooth out a stochastic model.
+  const runs = Math.min(5, Math.max(1, Number(req.body?.runs) || 1));
+  // Opt-in: reuse the memo cache so a repeat run is an instant $0 cache-hit — for
+  // demonstrating caching. Default off (every call is real, so cost/time are real).
+  const useCache = req.body?.useCache === true && runs === 1;
+
+  res.setHeader('Content-Type', 'application/x-ndjson');
+  res.setHeader('Cache-Control', 'no-cache');
+  const send = (obj) => res.write(JSON.stringify(obj) + '\n');
+
+  const norm = (s) => (s || '').toLowerCase().trim();
+  const avg = (xs) => (xs.length ? Math.round(xs.reduce((a, b) => a + b, 0) / xs.length) : 0);
+  const configs = cumulativeConfigs();
+  const model = activeImpactModel(); // tag the run so it can be compared across models
+  const collected = [];
+  send({ type: 'start', total: configs.length, caseCount: cases.length, runs, model });
+
+  // Score one case under one context. Resilient: a flaky model response (e.g.
+  // Anthropic occasionally emitting non-JSON) is retried once, then scored 0 — a
+  // single bad call must never abort a multi-call experiment.
+  const scoreOnce = async (c, context) => {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        // By default bypass the memo cache so cost/time/variance are real; with
+        // `useCache` on, a repeat run becomes an instant $0 cache-hit (the demo).
+        const { value: result, usage } = await withUsageCapture(() =>
+          analyzeImpact(c.change_text, context, null, [], undefined, { forcePath: 'oneshot', noCache: !useCache }));
+        const flagged = (result.concerns ?? []).map((x) => x.stationLabel);
+        const flaggedSet = new Set(flagged.map(norm));
+        const matched = c.expectedList.filter((e) => flaggedSet.has(norm(e)));
+        return {
+          recall: Math.round((matched.length / c.expectedList.length) * 100),
+          precision: flagged.length ? Math.round((matched.length / flagged.length) * 100) : 0,
+          inTokens: usage.inputTokens, outTokens: usage.outputTokens, costUsd: usage.costUsd,
+        };
+      } catch (err) {
+        if (isFatalLlmError(err)) throw err; // abort the whole experiment — retrying is pointless
+        if (attempt === 1) {
+          console.warn(`[experiment] "${c.name}" failed after retry: ${err.message}`);
+          return { recall: 0, precision: 0, failed: true, inTokens: 0, outTokens: 0, costUsd: 0 };
+        }
+      }
+    }
+  };
+
+  try {
+    for (let i = 0; i < configs.length; i++) {
+      const cfg = configs[i];
+      send({ type: 'layer-start', i: i + 1, total: configs.length, label: cfg.label });
+      const context = withLayers(fullContext, cfg.layers);
+      const contextChars = JSON.stringify(context).length;
+      const t0 = Date.now();
+      // Cases run concurrently; the N runs per case are sequential to bound load.
+      const perCase = await Promise.all(cases.map(async (c) => {
+        const rs = [];
+        for (let r = 0; r < runs; r++) rs.push(await scoreOnce(c, context));
+        return {
+          caseId: c.id, name: c.name,
+          recall: avg(rs.map((x) => x.recall)),
+          precision: avg(rs.map((x) => x.precision)),
+          recallRuns: rs.map((x) => x.recall),
+          failed: rs.some((x) => x.failed),
+          // Measured usage for this case, averaged per run (so it's comparable regardless of run count).
+          inTokens: Math.round(avg(rs.map((x) => x.inTokens || 0))),
+          outTokens: Math.round(avg(rs.map((x) => x.outTokens || 0))),
+          costUsd: rs.reduce((a, x) => a + (x.costUsd || 0), 0) / rs.length,
+        };
+      }));
+      const recall = avg(perCase.map((x) => x.recall));
+      const precision = avg(perCase.map((x) => x.precision));
+      const step = {
+        layer: cfg.id, label: cfg.label, layers: cfg.layers,
+        recall, precision,
+        f1: recall + precision ? Math.round((2 * recall * precision) / (recall + precision)) : 0,
+        contextChars, approxTokens: Math.round(contextChars / 4),
+        // Measured (real) usage summed across this layer's cases — the per-model cost.
+        inTokens: perCase.reduce((a, x) => a + x.inTokens, 0),
+        outTokens: perCase.reduce((a, x) => a + x.outTokens, 0),
+        costUsd: perCase.reduce((a, x) => a + x.costUsd, 0),
+        failedCount: perCase.filter((x) => x.failed).length, // calls that errored (scored 0)
+        ms: Date.now() - t0, cases: perCase,
+      };
+      collected.push(step);
+      send({ type: 'step', step });
+    }
+    // Persist the completed run so it can be compared against other models later.
+    const id = randomUUID();
+    db.prepare('INSERT INTO experiment_runs (id, created_at, provider, model, runs, case_count, case_ids, steps) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(id, new Date().toISOString(), model.provider, model.model, runs, cases.length, JSON.stringify(cases.map((c) => c.id)), JSON.stringify(collected));
+    send({ type: 'done', id, caseCount: cases.length, runs, model });
+    res.end();
+  } catch (err) {
+    console.error('Experiment error:', err);
+    send({ type: 'error', error: friendlyExperimentError(err), fatal: isFatalLlmError(err) });
+    res.end();
+  }
+});
+
+// Saved experiment runs — for comparing the same cases/layers across models.
+router.get('/impact/experiments', (req, res) => {
+  const rows = db.prepare('SELECT id, created_at, provider, model, runs, case_count, steps FROM experiment_runs ORDER BY created_at DESC').all();
+  res.json(rows.map((r) => {
+    const steps = JSON.parse(r.steps);
+    const last = steps[steps.length - 1] || {};
+    return {
+      id: r.id, createdAt: r.created_at, provider: r.provider, model: r.model,
+      runs: r.runs, caseCount: r.case_count, steps,
+      finalRecall: last.recall ?? null, finalPrecision: last.precision ?? null,
+      // Measured totals across all layers (the real cost of the whole run).
+      totalInTokens: steps.reduce((a, s) => a + (s.inTokens || 0), 0),
+      totalOutTokens: steps.reduce((a, s) => a + (s.outTokens || 0), 0),
+      totalCostUsd: steps.reduce((a, s) => a + (s.costUsd || 0), 0),
+      totalMs: steps.reduce((a, s) => a + (s.ms || 0), 0),
+      peakRecall: steps.reduce((m, s) => Math.max(m, s.recall ?? 0), 0),
+    };
+  }));
+});
+
+router.delete('/impact/experiments/:id', (req, res) => {
+  db.prepare('DELETE FROM experiment_runs WHERE id = ?').run(req.params.id);
+  res.json({ ok: true });
+});
+
+// Memoization cache — inspect + clear, to demo cache-hit ($0/instant) vs miss.
+router.get('/impact/cache', (req, res) => res.json({ count: impactCacheCount() }));
+router.delete('/impact/cache', (req, res) => res.json({ cleared: clearImpactCache(), count: 0 }));
 
 // ---- Saved / shareable impact reports ----
 router.post('/impact/reports', (req, res) => {

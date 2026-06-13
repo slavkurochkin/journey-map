@@ -99,7 +99,7 @@ export default function FeatureFlagList({ sessionId, stationId, sessionMappings 
   if (!effectiveMappings?.length) return null;
 
   return (
-    <CollapsibleSection title="Feature Flags" count={flags.length} storageKey="feature-flags">
+    <CollapsibleSection title="Feature Flags" count={flags.length} storageKey="feature-flags" defaultOpen={false}>
       {flags.length > 0 ? (
         <div className="space-y-1.5 mb-3">
           {flags.map((flag) => {

@@ -289,6 +289,71 @@ Replace the "dump everything" pattern in `analyzeImpact` with a `tool_use` loop 
 
 ---
 
+## Phase 8 — PR Blast-Radius Bot (impact in the PR workflow)
+**Status:** `not started`
+**Goal:** A developer opens a PR → we analyze the blast radius against the journey graph and post a
+single, evidence-cited comment ("here's what this likely affects + what to test"). Puts the tool
+**in the PR workflow** — the sharpest expression of the QA/test-automation positioning.
+
+> **Related:** this is the third consumer of the journey graph (alongside reactive impact analysis
+> and the proactive Improvement Advisor) and shares their data-gating + mapping principles — see
+> [`docs/automation-and-improvement-advisor.md`](docs/automation-and-improvement-advisor.md).
+
+### Why it's mostly already built
+`analyzeImpact` already takes a change description and returns the right shape for a PR comment:
+`summary`, ranked `concerns` (each with `evidence[]` + `checks`), and `reviewFocus` — literally
+"what a reviewer should scrutinize." The engine and output exist; this phase adds a trigger, a
+diff→graph bridge, and delivery.
+
+### The three pieces
+- **Trigger + delivery `[start here]`:** a **GitHub Action** on `pull_request`
+  opened/synchronize — grabs the diff, calls the impact service, posts/updates one **sticky**
+  comment (update-in-place, never one-per-push). No inbound server, repo-scoped token. (A GitHub
+  App / webhook is the heavier alternative — public endpoint, app registration, webhook secrets,
+  real auth — defer to multi-user.)
+- **Diff → change description `[the hard part]`:** the analyzer reasons over a journey graph keyed
+  by endpoints/services/stations, NOT source files. Bridge the gap deterministic-first (same
+  pattern as the flag/Linear mappings):
+  1. *Deterministic:* changed route defs → endpoints; changed file paths → services via a
+     `repo→service` map; reuse the existing endpoint-signature matching.
+  2. *LLM:* summarize the diff into the natural-language change `analyzeImpact` already accepts,
+     and fill gaps. New trust surface → keep it reviewable.
+- **Trust gates `[prerequisite, not optional]`:** auto-posting on every PR raises the cry-wolf
+  stakes. Post only above a confidence threshold; keep it advisory + evidence-cited (reviewers
+  verify each `evidence` item); one sticky comment; wire the existing 👍/👎 (`concern_feedback`)
+  into it. **Depends on Phase 7 Slice 2 (critic/verification)** to be trustworthy.
+
+### Multi-repo (the real shape of "a person works across many repos")
+"Many repos" = PRs arrive from many repos and must route to the right graph + the right slice of it.
+Two cases, different answers:
+- **Case A — many repos, ONE product (microservices / split FE+BE) `[the advantage]`:** a user
+  journey already spans repos (frontend, `auth-service`, `payment-service`…). The graph is keyed
+  by *journey*, not *repo*, so a PR in **any** contributing repo maps into the **same shared
+  graph** — including cross-service blast radius a per-repo tool can't see. Architecture:
+  **per-repo Action, shared brain** — each repo's Action calls one impact service, passing its repo
+  identity; a `repo→service(s)` registry (largely auto-derivable from traces' `servicesObserved`)
+  scopes the diff to the right stations. This is the differentiator, not a blocker.
+- **Case B — many UNRELATED products `[defer]`:** each product is its own graph → needs
+  **workspaces/multi-tenancy**. Today the app is single-user/single-SQLite and
+  `gatherStationContext()` merges *all* sessions into one graph (effectively one workspace), so this
+  requires the multi-user/Postgres work already deferred to Phase 5. Don't build it until a second
+  product actually exists.
+
+### Deliverables
+- [ ] `repo→service(s)` registry (auto-suggested from trace `servicesObserved`, user-confirmable)
+- [ ] Diff→change bridge: deterministic endpoint/service detection + LLM summary fallback
+- [ ] GitHub Action: diff → impact service → sticky PR comment built from `reviewFocus` +
+      above-threshold `concerns` (with evidence + checks)
+- [ ] Confidence gating + 👍/👎 feedback wired into the comment
+- [ ] (Case B only, deferred) workspace scoping so a repo resolves to the correct product graph
+
+### Caution
+- The bot is only as good as the journey graph behind it: a PR touching code with **no recorded
+  journey** → weak/empty analysis. Correct behavior is to **go quiet rather than guess** (silent
+  beats wrong). Ties directly to the maintenance-burden risk — coverage of the graph gates value.
+
+---
+
 ## Infrastructure Decisions
 
 | Decision | Choice | Revisit at |
@@ -299,3 +364,5 @@ Replace the "dump everything" pattern in `analyzeImpact` with a `tool_use` loop 
 | Chrome extension | Out of scope until P4 | Phase 4 |
 | MCP host | Connector-first (no client code); self-host only if stdio/non-Anthropic needed | Phase 6 |
 | Agent loop | Single `tool_use` loop in `transport()` (Anthropic first); shared by Phase 6 + 7 | Phase 7 |
+| PR integration | GitHub Action (per-repo, repo-scoped token), shared impact brain; App/webhook only if multi-user | Phase 8 |
+| Multi-repo | One product = one shared graph (per-repo Action, `repo→service` map); workspaces only for multiple products | Phase 8 |

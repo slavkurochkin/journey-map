@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import Icon from './Icon.jsx';
 import EvalChart, { EvalSparkline } from './EvalChart.jsx';
 import StationChips from './StationChips.jsx';
+import ContextExperiment from './ContextExperiment.jsx';
 
 function recallColor(r) {
   if (r == null) return 'text-gray-300';
@@ -170,6 +171,9 @@ export default function ImpactEvals() {
           <EvalChart history={history} />
         </div>
       )}
+
+      {/* Context-engineering experiment */}
+      <ContextExperiment cases={cases} />
 
       {/* New case */}
       <div className="bg-white dark:bg-gray-900 rounded-2xl border border-gray-200/70 dark:border-gray-800 shadow-soft p-5">

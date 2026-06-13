@@ -108,6 +108,28 @@ lower-churn. The advisor sits *last* because it's a consumer of all of the above
 
 ---
 
+## Related — Phase 8: PR Blast-Radius Bot
+
+The **PR Blast-Radius Bot** (PLAN.md → Phase 8) is the third consumer of the journey graph,
+alongside impact analysis (reactive) and the Improvement Advisor (proactive). On a PR it bridges
+the diff → graph and posts an evidence-cited comment. It belongs in this doc's orbit for two
+reasons:
+
+- **Same gating thesis.** Like the advisor, it's *only as good as the auto-populated graph*. A PR
+  touching code with no recorded journey → weak/empty analysis; correct behavior is to **go quiet,
+  not guess**. So the Part 2 automation roadmap (traces → incidents → coverage) is its prerequisite
+  too — it gets sharper as context auto-populates at scale.
+- **Same mapping principle.** Its new primitive — a `repo→service(s)` map (auto-suggested from
+  trace `servicesObserved`, user-confirmed) — is the same *deterministic-first, propose-don't-commit*
+  pattern as the connectors above. Map a signal (here, a repo's diff) to canonical stations
+  deterministically where possible, LLM only where fuzzy, tagged and reviewable.
+
+For a single product, "many repos" is an **advantage**, not a blocker: one shared graph, a per-repo
+Action calling one impact brain. Multiple *unrelated* products need workspaces/multi-tenancy —
+deferred with the Phase 5 multi-user work. Full write-up in PLAN.md → Phase 8.
+
+---
+
 ## TL;DR
 - The Improvement Advisor is a good idea **whose value is gated on data richness**; building it
   now would mostly reprint the existing lenses or risk generic advice. **Defer.**

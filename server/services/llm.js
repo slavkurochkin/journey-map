@@ -1,6 +1,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import OpenAI from 'openai';
 import { createHash } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { SYSTEM_PROMPT, IMPACT_SYSTEM_PROMPT, IMPACT_AGENT_SYSTEM_PROMPT, CRITIC_SYSTEM_PROMPT, IMPACT_CHAT_SYSTEM_PROMPT, TEST_PLAN_SYSTEM_PROMPT, CLARIFYING_QUESTIONS_PROMPT } from './prompt.js';
 import { getSettings } from './settings.js';
 import { enabledMcpServers } from './mcp.js';
@@ -28,6 +29,13 @@ function activeModelFor(label, settings) {
   return (baseRate != null && cheapRate != null && baseRate > cheapRate) ? CHEAP_MODEL : base;
 }
 
+// The provider + model the impact analysis would actually use right now (after
+// smart-routing). Lets the experiment tag each run so results compare across models.
+export function activeImpactModel() {
+  const settings = getSettings();
+  return { provider: settings.provider, model: activeModelFor('impact', settings) };
+}
+
 // ---- App-level result memoization (100% off on exact repeats) ----
 function cacheKey(parts) {
   return createHash('sha256').update(JSON.stringify(parts)).digest('hex');
@@ -39,6 +47,15 @@ function getCached(key) {
 function putCached(key, result) {
   db.prepare('INSERT OR REPLACE INTO impact_cache (key, result, created_at) VALUES (?, ?, ?)')
     .run(key, JSON.stringify(result), new Date().toISOString());
+}
+
+// Memoization controls — for demonstrating cache-hit ($0, instant) vs miss (real
+// call, real cost/time).
+export function impactCacheCount() {
+  return db.prepare('SELECT COUNT(*) AS c FROM impact_cache').get().c;
+}
+export function clearImpactCache() {
+  return db.prepare('DELETE FROM impact_cache').run().changes;
 }
 
 // Extract the first COMPLETE JSON object/array via brace matching (handles
@@ -67,14 +84,19 @@ function extractFirstJson(s) {
 // Tolerant JSON parse: models often wrap output in prose or code fences, or emit
 // a trailing block — fall back to the first complete {...} / [...].
 function parseJsonResponse(text) {
-  const stripped = text.replace(/^```(?:json)?\s*/m, '').replace(/\s*```\s*$/m, '').trim();
+  // Anthropic has no response_format guarantee, so it often wraps JSON in ```json
+  // fences and occasionally adds a sentence of preamble/epilogue. Strip ALL fences
+  // (anywhere, not just anchored), then fall back to the first complete {...}/[...]
+  // block — and never let a recovery attempt throw a raw parse error.
+  const stripped = String(text || '').replace(/```+(?:json)?/gi, '').trim();
   try {
     return JSON.parse(stripped);
-  } catch {
-    const block = extractFirstJson(stripped);
-    if (block) return JSON.parse(block);
-    throw new Error('Model did not return valid JSON');
+  } catch { /* recover a bare block below */ }
+  const block = extractFirstJson(stripped);
+  if (block) {
+    try { return JSON.parse(block); } catch { /* fall through to friendly error */ }
   }
+  throw new Error('Model did not return valid JSON');
 }
 
 // Which providers are usable right now (keys present / assumed-local for Ollama).
@@ -110,6 +132,19 @@ const PRICING = {
 //   Anthropic → input_tokens (fresh) + cache_creation (write, 1.25x) + cache_read (0.1x)
 //   OpenAI    → prompt_tokens (total) with prompt_tokens_details.cached_tokens (0.5x) inside it
 // Normalize both to fresh / write / read so the line reads the same.
+// Captures measured token usage + $ cost across every model call within a scope,
+// surviving awaits and parallel branches — see withUsageCapture. logUsage writes
+// into the active store if one is set, so no call site needs to thread a callback.
+const usageStore = new AsyncLocalStorage();
+
+// Run `fn` and return { value, usage:{ inputTokens, outputTokens, costUsd } } with
+// the totals of every LLM call it made (one-shot + critic + any tool turns).
+export async function withUsageCapture(fn) {
+  const store = { inputTokens: 0, outputTokens: 0, costUsd: 0 };
+  const value = await usageStore.run(store, fn);
+  return { value, usage: store };
+}
+
 function logUsage(label, provider, model, u) {
   if (!u) return;
   let fresh, write, read, out;
@@ -126,17 +161,20 @@ function logUsage(label, provider, model, u) {
   }
   const promptTotal = fresh + write + read;
   const hit = promptTotal ? Math.round((read / promptTotal) * 100) : 0;
-  let cost = '';
+  let costNum = 0;
   const p = PRICING[model];
   if (p) {
     // Anthropic: write 1.25x, read 0.1x. OpenAI: cached read 0.5x, no write premium.
     const inCost = provider === 'anthropic'
       ? fresh * p.in + write * p.in * 1.25 + read * p.in * 0.1
       : fresh * p.in + read * p.in * 0.5;
-    cost = ` · ~$${((inCost + out * p.out) / 1e6).toFixed(5)}`;
+    costNum = (inCost + out * p.out) / 1e6;
   }
+  // Accumulate into the active capture scope, if any.
+  const store = usageStore.getStore();
+  if (store) { store.inputTokens += promptTotal; store.outputTokens += out; store.costUsd += costNum; }
   console.log(
-    `[llm] ${label} · ${model} · in ${fresh} · write ${write} · read ${read} (${hit}% cached) · out ${out}${cost}`
+    `[llm] ${label} · ${model} · in ${fresh} · write ${write} · read ${read} (${hit}% cached) · out ${out}${p ? ` · ~$${costNum.toFixed(5)}` : ''}`
   );
 }
 
@@ -436,14 +474,18 @@ function shouldUseAgent(context) {
   return stations > 25 || size > 45000;
 }
 
-export async function analyzeImpact(query, context, facts = null, extraFacts = [], onEvent) {
+export async function analyzeImpact(query, context, facts = null, extraFacts = [], onEvent, options = {}) {
   assertConfigured();
   const settings = getSettings();
   const fb = factsBlock(facts, extraFacts);
   const memory = evalMemoryHint(query);
-  const useAgent = shouldUseAgent(context);
+  // `forcePath` lets the context experiment pin the engine (always one-shot) so the
+  // only thing varying across runs is the context, not the agent/one-shot split.
+  const useAgent = options.forcePath ? options.forcePath === 'agent' : shouldUseAgent(context);
   const key = cacheKey([useAgent ? 'impact-agent' : 'impact-oneshot', settings.provider, activeModelFor('impact', settings), settings.maxTokens, settings.temperature, query, fb, memory, context]);
-  const cached = getCached(key);
+  // `noCache` (experiment averaging) skips the memo entirely — otherwise repeated
+  // runs return the same cached answer and the variance we're measuring vanishes.
+  const cached = options.noCache ? null : getCached(key);
   if (cached) { console.log('[llm] impact · cache hit (app) · $0'); return cached; }
 
   const userMessage = `CHANGE:\n${query}${fb}${memory}`;
@@ -502,7 +544,7 @@ export async function analyzeImpact(query, context, facts = null, extraFacts = [
     console.warn('[critic] skipped:', err.message);
   }
   result.trail = trail;
-  putCached(key, result);
+  if (!options.noCache) putCached(key, result);
   return result;
 }
 

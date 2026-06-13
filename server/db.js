@@ -151,6 +151,19 @@ migrate(`ALTER TABLE station_overrides ADD COLUMN color TEXT`);
 // Per-canonical-station action edits applied at aggregation time (does NOT touch
 // the source recordings). JSON: { hidden: [sigKey…], renames: { sigKey: text } }.
 migrate(`ALTER TABLE station_overrides ADD COLUMN actions TEXT`);
+// Saved context-engineering experiment runs — one row per run, tagged with the
+// model used, so results can be compared across models. `steps` is the per-layer
+// JSON array (recall/precision/tokens/per-case).
+migrate(`CREATE TABLE IF NOT EXISTS experiment_runs (
+  id TEXT PRIMARY KEY,
+  created_at TEXT NOT NULL,
+  provider TEXT,
+  model TEXT,
+  runs INTEGER NOT NULL DEFAULT 1,
+  case_count INTEGER NOT NULL,
+  case_ids TEXT,
+  steps TEXT NOT NULL
+)`);
 // Distributed traces (OTLP) attached to a station, matched cross-session by the
 // derived endpoint signature — same model as api_requests. Spans live in `spans`.
 migrate(`CREATE TABLE IF NOT EXISTS traces (
