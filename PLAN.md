@@ -354,6 +354,41 @@ Two cases, different answers:
 
 ---
 
+## Phase 9 — CLI / Automation Surface
+**Status:** `not started`
+**Goal:** A thin, headless command-line skin over the **same** engine, for the contexts where a
+terminal beats the web app: CI, scripts, and the PR bot's mechanism. Complements the visual
+platform — it does **not** replace it.
+
+### Why it's cheap (architecture already allows it)
+- The brain is plain functions in `server/services/` (`analyzeImpact`, `gatherStationContext`,
+  `saveSession`, the eval runner) — a CLI imports them directly; no HTTP needed.
+- Storage is local-file SQLite (`node:sqlite`) — exactly what a local CLI wants.
+- Exporters (Markdown / Mermaid / Playwright / Gherkin) already exist from P1 — `export` is
+  mostly already written.
+
+### Scope (tight — automation only)
+- [ ] `journeymap impact "<change>"` (and `--diff <ref>`) → ranked concerns; `--json` for piping.
+      This is the headless mechanism **Phase 8's GitHub Action shells out to.**
+- [ ] `journeymap eval run` → run `eval_cases`, exit non-zero on recall/precision regression — an
+      **impact-analysis CI gate** (directly serves the Phase 7 verifiability/trust priority). The
+      single highest-value command.
+- [ ] `journeymap import <recording.json>` → reuse `saveSession` (+ the auto-extractors).
+- [ ] `journeymap export <session>` → emit existing Markdown/Mermaid/Playwright/Gherkin.
+- For anything visual, print a link to the web view — don't try to render the map in a terminal.
+
+### Guardrails
+- **Never fork the logic** — the CLI calls the same service functions / server, so it can't drift
+  from the web app. A parallel feature set is the failure mode.
+- Stay scoped to automation commands. This is a standing scope-drift risk; resist growing it into
+  a second product surface.
+
+### Out of Scope
+- Replacing the web UI — the **visual journey map (subway map, screenshots, heatmap lens) is the
+  differentiator** and can't live in a terminal.
+
+---
+
 ## Infrastructure Decisions
 
 | Decision | Choice | Revisit at |
@@ -366,3 +401,4 @@ Two cases, different answers:
 | Agent loop | Single `tool_use` loop in `transport()` (Anthropic first); shared by Phase 6 + 7 | Phase 7 |
 | PR integration | GitHub Action (per-repo, repo-scoped token), shared impact brain; App/webhook only if multi-user | Phase 8 |
 | Multi-repo | One product = one shared graph (per-repo Action, `repo→service` map); workspaces only for multiple products | Phase 8 |
+| CLI | Thin headless skin over the shared service functions (no forked logic); automation/CI only, never replaces the web UI | Phase 9 |
