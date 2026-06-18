@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { LAYERS, withLayers, cumulativeConfigs } from '../services/contextLayers.js';
+import { LAYERS, withLayers, cumulativeConfigs, leaveOneOutConfigs, saturationConfigs, padContext } from '../services/contextLayers.js';
 
 const fullContext = {
   stations: [{
@@ -78,6 +78,38 @@ test('an empty layer is a true no-op (no phantom fields or tokens)', () => {
   assert.ok(!('pastIncidents' in withDocs.stations[0]));
   assert.ok(!('journeyDocs' in withDocs));
   assert.equal(JSON.stringify(withDocs).length, JSON.stringify(withoutDocs).length, 'no token cost for an empty layer');
+});
+
+test('leaveOneOutConfigs is full-context plus full-minus-each-optional-layer', () => {
+  const configs = leaveOneOutConfigs();
+  const optional = LAYERS.filter((l) => !l.always);
+  assert.equal(configs.length, optional.length + 1, 'full + one removal per optional layer');
+  assert.deepEqual(configs[0].layers.sort(), LAYERS.map((l) => l.id).sort(), 'first config is the full stack');
+  assert.equal(configs[0].removed, null);
+  // each subsequent config drops exactly one optional layer and keeps the rest
+  for (let i = 1; i < configs.length; i++) {
+    const c = configs[i];
+    assert.ok(!c.layers.includes(c.removed), 'the removed layer is absent');
+    assert.equal(c.layers.length, LAYERS.length - 1);
+    assert.ok(LAYERS.find((l) => l.always).id && c.layers.includes('journey'), 'baseline layer is never removed');
+  }
+});
+
+test('padContext inflates context toward the requested factor with filler', () => {
+  // Use a non-trivial base so chunk granularity is negligible.
+  const ctx = { stations: Array.from({ length: 20 }, (_, i) => ({ id: `s${i}`, label: `Station ${i}`, actions: ['do a thing', 'do another'] })), edges: [] };
+  const base = JSON.stringify(ctx).length;
+  assert.equal(JSON.stringify(padContext(ctx, 1)).length, base, '1× is a no-op');
+  const tripled = JSON.stringify(padContext(ctx, 3)).length;
+  const ratio = tripled / base;
+  assert.ok(ratio > 2.7 && ratio < 3.4, `~3× (got ${ratio.toFixed(2)}×)`);
+  assert.ok(Array.isArray(padContext(ctx, 3).referenceMaterial), 'filler lives in referenceMaterial');
+});
+
+test('saturationConfigs starts at 1× and increases', () => {
+  const c = saturationConfigs();
+  assert.equal(c[0].factor, 1);
+  for (let i = 1; i < c.length; i++) assert.ok(c[i].factor > c[i - 1].factor);
 });
 
 test('context shrinks monotonically as layers are removed', () => {

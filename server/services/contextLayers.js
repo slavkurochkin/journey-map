@@ -57,6 +57,47 @@ export function withLayers(context, enabledLayerIds) {
   return out;
 }
 
+// Saturation stress-test: the full stack, then padded with increasing amounts of
+// plausible-but-irrelevant filler. F1 should plateau while tokens (cost) keep rising —
+// the "past N tokens you're just burning money" curve.
+export const SATURATION_FACTORS = [1, 2, 3, 5, 8];
+export function saturationConfigs() {
+  return SATURATION_FACTORS.map((f) => ({ id: `${f}x`, label: `${f}× context`, factor: f }));
+}
+
+// Inflate a context to ~factor× its JSON size with irrelevant "reference material"
+// chunks — noise the model must sift through, not new signal.
+export function padContext(context, factor) {
+  if (!factor || factor <= 1) return context;
+  const base = JSON.stringify(context).length;
+  const extra = Math.round(base * (factor - 1));
+  const line = 'Archived internal reference: legacy module notes, closed ticket summaries, and historical configuration details not relevant to the current change. ';
+  const chunks = [];
+  let acc = 0, n = 0;
+  while (acc < extra) {
+    const target = Math.min(700, extra - acc);
+    let chunk = '';
+    while (chunk.length < target) chunk += line;
+    chunk = `[ref-${n++}] ${chunk.slice(0, target)}`;
+    chunks.push(chunk);
+    acc += chunk.length;
+  }
+  return { ...context, referenceMaterial: chunks };
+}
+
+// Leave-one-out: the full stack, then the full stack MINUS each optional layer. The
+// F1 drop when a layer is removed is its honest attribution — measured by ablation,
+// not by asking the model what it "used".
+export function leaveOneOutConfigs() {
+  const all = LAYERS.map((l) => l.id);
+  const optional = LAYERS.filter((l) => !l.always);
+  const configs = [{ id: 'full', label: 'Full context', layers: [...all], removed: null }];
+  for (const layer of optional) {
+    configs.push({ id: layer, label: `− ${layer.label}`, layers: all.filter((l) => l !== layer.id), removed: layer.id });
+  }
+  return configs;
+}
+
 // The cumulative ladder: [L0], [L0,L1], [L0,L1,L2], … each step adding one layer.
 // This is the "does more context help?" curve.
 export function cumulativeConfigs() {

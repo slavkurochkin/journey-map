@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { randomUUID } from 'node:crypto';
 import db from '../db.js';
 import { aggregateResults, gatherStationContext, buildTestPlanContext, loadStationOverrides } from '../services/stations.js';
-import { withLayers, cumulativeConfigs } from '../services/contextLayers.js';
+import { withLayers, cumulativeConfigs, leaveOneOutConfigs, saturationConfigs, padContext } from '../services/contextLayers.js';
 import { endpointKeyFromString } from '../services/endpoints.js';
 import { analyzeImpact, chatImpact, generateTestPlan, generateClarifyingQuestions, activeImpactModel, withUsageCapture, impactCacheCount, clearImpactCache } from '../services/llm.js';
 
@@ -354,12 +354,15 @@ router.post('/impact/experiment', async (req, res) => {
   res.setHeader('Cache-Control', 'no-cache');
   const send = (obj) => res.write(JSON.stringify(obj) + '\n');
 
+  // Mode: cumulative ladder (does more context help?), leave-one-out ablation (which
+  // layers does the model rely on?), or saturation (where does extra context stop paying?).
+  const mode = ['ablation', 'saturation'].includes(req.body?.mode) ? req.body.mode : 'cumulative';
   const norm = (s) => (s || '').toLowerCase().trim();
   const avg = (xs) => (xs.length ? Math.round(xs.reduce((a, b) => a + b, 0) / xs.length) : 0);
-  const configs = cumulativeConfigs();
+  const configs = mode === 'ablation' ? leaveOneOutConfigs() : mode === 'saturation' ? saturationConfigs() : cumulativeConfigs();
   const model = activeImpactModel(); // tag the run so it can be compared across models
   const collected = [];
-  send({ type: 'start', total: configs.length, caseCount: cases.length, runs, model });
+  send({ type: 'start', total: configs.length, caseCount: cases.length, runs, model, mode });
 
   // Score one case under one context. Resilient: a flaky model response (e.g.
   // Anthropic occasionally emitting non-JSON) is retried once, then scored 0 — a
@@ -393,7 +396,7 @@ router.post('/impact/experiment', async (req, res) => {
     for (let i = 0; i < configs.length; i++) {
       const cfg = configs[i];
       send({ type: 'layer-start', i: i + 1, total: configs.length, label: cfg.label });
-      const context = withLayers(fullContext, cfg.layers);
+      const context = mode === 'saturation' ? padContext(fullContext, cfg.factor) : withLayers(fullContext, cfg.layers);
       const contextChars = JSON.stringify(context).length;
       const t0 = Date.now();
       // Cases run concurrently; the N runs per case are sequential to bound load.
@@ -405,6 +408,7 @@ router.post('/impact/experiment', async (req, res) => {
           recall: avg(rs.map((x) => x.recall)),
           precision: avg(rs.map((x) => x.precision)),
           recallRuns: rs.map((x) => x.recall),
+          precisionRuns: rs.map((x) => x.precision),
           failed: rs.some((x) => x.failed),
           // Measured usage for this case, averaged per run (so it's comparable regardless of run count).
           inTokens: Math.round(avg(rs.map((x) => x.inTokens || 0))),
@@ -414,10 +418,22 @@ router.post('/impact/experiment', async (req, res) => {
       }));
       const recall = avg(perCase.map((x) => x.recall));
       const precision = avg(perCase.map((x) => x.precision));
+      const f1of = (r, p) => (r + p ? Math.round((2 * r * p) / (r + p)) : 0);
+      // Run-to-run F1 variance: aggregate each run across cases, then std-dev over runs.
+      let f1Std = 0;
+      if (runs > 1) {
+        const f1Runs = [];
+        for (let r = 0; r < runs; r++) {
+          f1Runs.push(f1of(avg(perCase.map((c) => c.recallRuns[r] ?? 0)), avg(perCase.map((c) => c.precisionRuns[r] ?? 0))));
+        }
+        const m = avg(f1Runs);
+        f1Std = Math.round(Math.sqrt(f1Runs.reduce((a, v) => a + (v - m) ** 2, 0) / f1Runs.length));
+      }
       const step = {
         layer: cfg.id, label: cfg.label, layers: cfg.layers,
         recall, precision,
-        f1: recall + precision ? Math.round((2 * recall * precision) / (recall + precision)) : 0,
+        f1: f1of(recall, precision),
+        f1Std,
         contextChars, approxTokens: Math.round(contextChars / 4),
         // Measured (real) usage summed across this layer's cases — the per-model cost.
         inTokens: perCase.reduce((a, x) => a + x.inTokens, 0),
@@ -429,11 +445,15 @@ router.post('/impact/experiment', async (req, res) => {
       collected.push(step);
       send({ type: 'step', step });
     }
-    // Persist the completed run so it can be compared against other models later.
-    const id = randomUUID();
-    db.prepare('INSERT INTO experiment_runs (id, created_at, provider, model, runs, case_count, case_ids, steps) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(id, new Date().toISOString(), model.provider, model.model, runs, cases.length, JSON.stringify(cases.map((c) => c.id)), JSON.stringify(collected));
-    send({ type: 'done', id, caseCount: cases.length, runs, model });
+    // Persist cumulative runs (for cross-model comparison). Ablation runs are a live
+    // diagnostic with a different step shape, so they're not saved (would misalign).
+    let id = null;
+    if (mode === 'cumulative') {
+      id = randomUUID();
+      db.prepare('INSERT INTO experiment_runs (id, created_at, provider, model, runs, case_count, case_ids, steps) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(id, new Date().toISOString(), model.provider, model.model, runs, cases.length, JSON.stringify(cases.map((c) => c.id)), JSON.stringify(collected));
+    }
+    send({ type: 'done', id, caseCount: cases.length, runs, model, mode });
     res.end();
   } catch (err) {
     console.error('Experiment error:', err);
